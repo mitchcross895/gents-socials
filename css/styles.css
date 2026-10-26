@@ -21,8 +21,9 @@
   color-scheme: light;
 }
 
+/* Dark tokens: follow the device unless the user picked a theme (data-theme on <html>) */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #121316;
     --surface: #1b1d21;
     --surface-2: #24272c;
@@ -38,6 +39,23 @@
     --shadow: none;
     color-scheme: dark;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #121316;
+  --surface: #1b1d21;
+  --surface-2: #24272c;
+  --text: #ececee;
+  --muted: #9a9ea8;
+  --border: #2e3137;
+  --accent: #d4a24c;
+  --accent-hover: #e2b462;
+  --accent-contrast: #1b1d21;
+  --accent-soft: #3a2f1c;
+  --like: #ef6b7f;
+  --danger: #f2867d;
+  --shadow: none;
+  color-scheme: dark;
 }
 
 /* ---------- Base ---------- */
@@ -105,7 +123,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
   -webkit-backdrop-filter: saturate(1.4) blur(10px);
   border-bottom: 1px solid var(--border);
 }
+.topbar-right { display: flex; align-items: center; gap: 8px; }
 .topbar-title { font-weight: 600; color: var(--muted); }
+
+.theme-toggle {
+  display: grid; place-items: center;
+  width: 40px; height: 40px;
+  border: 1px solid var(--border); border-radius: 50%;
+  background: var(--surface); color: var(--text); cursor: pointer;
+}
+.theme-toggle:hover { background: var(--surface-2); }
+.theme-toggle .icon { width: 20px; height: 20px; }
+.theme-toggle .theme-label { display: none; }
 
 .layout { width: 100%; max-width: 1240px; margin: 0 auto; }
 
@@ -135,6 +164,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .nav-link[aria-current="page"] { color: var(--accent); }
 .nav-link[aria-current="page"] .icon { stroke-width: 2.4; }
+
+/* Sidebar theme switch (tablet/desktop only; mobile uses the top bar one) */
+.nav-theme { display: none; border: 0; background: none; cursor: pointer; }
 
 /* ---------- Components ---------- */
 .view-header {
@@ -397,6 +429,7 @@ a.byline-name:hover { text-decoration: underline; }
   }
   .nav-link span { display: none; }
   .nav-link:hover { background: var(--surface-2); color: var(--text); }
+  .nav-theme { display: flex; }
   .nav-link[aria-current="page"] { background: var(--accent-soft); color: var(--accent); }
 
   .chips { margin: 0 0 16px; padding: 0 0 2px; }

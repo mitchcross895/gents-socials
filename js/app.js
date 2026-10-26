@@ -13,8 +13,31 @@
     comment: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z"/></svg>',
     trash: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
     plus: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-    back: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>'
+    back: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>',
+    sun: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>',
+    moon: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
   };
+
+  // ---------- Theme (light/dark, remembered per browser) ----------
+
+  const THEME_KEY = 'gents-socials:theme';
+  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+  function currentTheme() {
+    return document.documentElement.dataset.theme || (darkQuery.matches ? 'dark' : 'light');
+  }
+
+  function syncThemeControls() {
+    const dark = currentTheme() === 'dark';
+    document.querySelectorAll('[data-action="toggle-theme"]').forEach(function (btn) {
+      btn.setAttribute('aria-label', dark ? 'Switch to light mode' : 'Switch to dark mode');
+      btn.innerHTML = (dark ? ICONS.sun : ICONS.moon) + '<span class="theme-label">' + (dark ? 'Light mode' : 'Dark mode') + '</span>';
+    });
+    const bg = getComputedStyle(document.body).backgroundColor;
+    document.querySelectorAll('meta[name="theme-color"]').forEach(function (meta) { meta.content = bg; });
+  }
+
+  darkQuery.addEventListener('change', syncThemeControls);
 
   // ---------- Storage (browser-only until a database exists) ----------
 
@@ -239,7 +262,6 @@
     const myPosts = state.posts.filter(function (p) { return p.authorId === ME; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
     const myThreads = state.threads.filter(function (t) { return t.authorId === ME; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
     const likes = myPosts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
-    const joined = new Date(me.joined).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
     const color = AVATAR_COLORS.includes(me.color) ? me.color : AVATAR_COLORS[0];
 
     let list;
@@ -259,8 +281,7 @@
           (ui.editingProfile ? profileForm(me) :
             '<h2 class="profile-name">' + esc(me.name) + '</h2>' +
             '<p class="muted">@' + esc(me.handle) + '</p>' +
-            (me.bio ? '<p class="profile-bio">' + esc(me.bio) + '</p>' : '') +
-            '<p class="muted small">Joined ' + esc(joined) + '</p>') +
+            (me.bio ? '<p class="profile-bio">' + esc(me.bio) + '</p>' : '')) +
           '<dl class="stats">' +
             '<div><dt>Posts</dt><dd>' + myPosts.length + '</dd></div>' +
             '<div><dt>Threads</dt><dd>' + myThreads.length + '</dd></div>' +
@@ -356,6 +377,12 @@
   }
 
   const actions = {
+    'toggle-theme': function () {
+      const next = currentTheme() === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* ignore */ }
+      syncThemeControls();
+    },
     like: function (el) {
       const post = findPost(el);
       const i = post.likes.indexOf(ME);
@@ -500,4 +527,5 @@
   });
 
   render();
+  syncThemeControls();
 })();

@@ -9,11 +9,11 @@ window.createSeedData = function () {
   return {
     version: 1,
     users: {
-      me: { id: 'me', name: 'New Member', handle: 'member', bio: 'Just joined. Say hello!', color: '#9a6b1f', joined: now - 2 * day },
-      james: { id: 'james', name: 'James Whitaker', handle: 'jwhitaker', bio: 'Tailoring nerd. Coffee first.', color: '#2f6f8f', joined: now - 400 * day },
-      marcus: { id: 'marcus', name: 'Marcus Bell', handle: 'mbell', bio: 'Lifting, cooking, and bad puns.', color: '#5b7f3a', joined: now - 250 * day },
-      theo: { id: 'theo', name: 'Theo Grant', handle: 'theog', bio: 'Product designer. Weekend woodworker.', color: '#8a4b8f', joined: now - 120 * day },
-      sam: { id: 'sam', name: 'Sam Ortiz', handle: 'samo', bio: 'Always planning the next road trip.', color: '#b4492f', joined: now - 60 * day }
+      me: { id: 'me', name: 'New Member', handle: 'member', bio: 'Just joined. Say hello!', color: '#9a6b1f' },
+      james: { id: 'james', name: 'James Whitaker', handle: 'jwhitaker', bio: 'Tailoring nerd. Coffee first.', color: '#2f6f8f' },
+      marcus: { id: 'marcus', name: 'Marcus Bell', handle: 'mbell', bio: 'Lifting, cooking, and bad puns.', color: '#5b7f3a' },
+      theo: { id: 'theo', name: 'Theo Grant', handle: 'theog', bio: 'Product designer. Weekend woodworker.', color: '#8a4b8f' },
+      sam: { id: 'sam', name: 'Sam Ortiz', handle: 'samo', bio: 'Always planning the next road trip.', color: '#b4492f' }
     },
     posts: [
       {
