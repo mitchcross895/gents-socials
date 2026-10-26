@@ -8,13 +8,10 @@
   <meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#121316" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%239a6b1f'/%3E%3Ctext x='32' y='44' font-family='Georgia,serif' font-size='34' font-weight='700' text-anchor='middle' fill='%23fff'%3EG%3C/text%3E%3C/svg%3E">
-  <script>
-    // Apply a saved theme before first paint to avoid a flash of the wrong colors
-    try {
-      var savedTheme = localStorage.getItem('gents-socials:theme');
-      if (savedTheme === 'light' || savedTheme === 'dark') document.documentElement.dataset.theme = savedTheme;
-    } catch (e) {}
-  </script>
+  <!-- Only allow scripts from this site and the pinned Supabase library; only send data to Supabase -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; base-uri 'self'; form-action 'self'; object-src 'none'">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <script src="js/theme-init.js"></script>
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
@@ -54,9 +51,8 @@
     <aside class="aside" id="aside" aria-label="Highlights"></aside>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js" integrity="sha384-0w2KAL2YHP6wKOkUDzkCDGgVvfmHnj02DHeQ6XcHOgTfFsGyonKOpShMH1x6nk9o" crossorigin="anonymous"></script>
   <script src="js/config.js"></script>
-  <script src="js/data.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

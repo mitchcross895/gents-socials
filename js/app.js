@@ -1,7 +1,6 @@
 (function () {
   'use strict';
 
-  const STORAGE_KEY = 'gents-socials:v1';
   const MAX_POST = 500;
   const CATEGORIES = ['General', 'Style', 'Fitness', 'Career', 'Off-topic'];
   const AVATAR_COLORS = ['#9a6b1f', '#2f6f8f', '#5b7f3a', '#8a4b8f', '#b4492f', '#3d4a5c'];
@@ -38,29 +37,15 @@
 
   darkQuery.addEventListener('change', syncThemeControls);
 
-  // ---------- Data source ----------
-  // With Supabase configured in js/config.js, data lives in the database and members sign in.
-  // Without it, the site runs in demo mode: seed data saved to this browser only.
+  // ---------- Data source (Supabase, configured in js/config.js) ----------
 
   const config = window.GENTS_CONFIG || {};
   const sb = config.supabaseUrl && config.supabaseKey && window.supabase
     ? window.supabase.createClient(config.supabaseUrl, config.supabaseKey)
     : null;
 
-  function loadLocalState() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-      if (saved && saved.version === 1) return saved;
-    } catch (e) { /* storage unavailable or corrupt */ }
-    return window.createSeedData();
-  }
-
-  function saveLocalState() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* ignore */ }
-  }
-
-  let state = sb ? { users: {}, posts: [], threads: [] } : loadLocalState();
-  let meId = sb ? null : 'me'; // signed-in user's id; null when signed out
+  let state = { users: {}, posts: [], threads: [] };
+  let meId = null; // signed-in user's id; null when signed out
   let loading = !!sb;
 
   // Transient UI state (not persisted)
@@ -120,48 +105,7 @@
       .finally(function () { loading = false; render(); });
   }
 
-  // Both data sources expose the same operations
-  const localApi = {
-    createPost: async function (text) {
-      state.posts.push({ id: uid('p'), authorId: meId, text: text, createdAt: Date.now(), likes: [], comments: [] });
-      saveLocalState();
-    },
-    toggleLike: async function (post) {
-      const i = post.likes.indexOf(meId);
-      if (i === -1) post.likes.push(meId); else post.likes.splice(i, 1);
-      saveLocalState();
-    },
-    deletePost: async function (post) {
-      state.posts = state.posts.filter(function (p) { return p !== post; });
-      saveLocalState();
-    },
-    addComment: async function (post, text) {
-      post.comments.push({ id: uid('c'), authorId: meId, text: text, createdAt: Date.now() });
-      saveLocalState();
-    },
-    createThread: async function (fields) {
-      const thread = Object.assign({ id: uid('t'), authorId: meId, createdAt: Date.now(), replies: [] }, fields);
-      state.threads.push(thread);
-      saveLocalState();
-      return thread.id;
-    },
-    addReply: async function (thread, text) {
-      thread.replies.push({ id: uid('r'), authorId: meId, text: text, createdAt: Date.now() });
-      saveLocalState();
-    },
-    deleteThread: async function (id) {
-      state.threads = state.threads.filter(function (t) { return t.id !== id; });
-      saveLocalState();
-    },
-    saveProfile: async function (fields) {
-      const taken = Object.values(state.users).some(function (u) { return u.id !== meId && u.handle === fields.handle; });
-      if (taken) throw { code: '23505' };
-      Object.assign(state.users[meId], fields);
-      saveLocalState();
-    }
-  };
-
-  const remoteApi = {
+  const api = {
     createPost: function (text) {
       return query(sb.from('posts').insert({ body: text }));
     },
@@ -191,14 +135,12 @@
     }
   };
 
-  const api = sb ? remoteApi : localApi;
-
   // Runs a data operation, refreshes from the database, and re-renders. Resolves true on success.
   async function run(task) {
     ui.error = '';
     try {
       await task();
-      if (sb) await loadRemoteState();
+      await loadRemoteState();
       return true;
     } catch (err) {
       ui.error = describeError(err);
@@ -222,10 +164,6 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
-  }
-
-  function uid(prefix) {
-    return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
 
   function getUser(id) {
@@ -439,9 +377,7 @@
       list = myThreads.length ? '<div class="card thread-list">' + myThreads.map(threadRow).join('') + '</div>' : emptyState('You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.');
     }
 
-    const footer = sb
-      ? '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>'
-      : '<p class="reset-note muted small">Demo mode: data is saved in this browser only. <button class="link-btn" data-action="reset-data">Reset demo data</button></p>';
+    const footer = '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>';
 
     return viewHeader('Profile') +
       '<section class="card profile">' +
@@ -544,10 +480,20 @@
     const route = parseRoute();
     const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile };
     const error = ui.error ? '<p class="notice notice-error" role="alert">' + esc(ui.error) + '</p>' : '';
-    viewEl.innerHTML = error + (loading ? emptyState('Loading…') : views[route.name](route));
-    asideEl.innerHTML = loading ? '' : renderAside();
+    let body;
+    if (!sb) {
+      body = emptyState(window.supabase
+        ? "gentcore isn't connected to its database yet. Add the Supabase URL and key to <code>js/config.js</code>."
+        : "Couldn't load the Supabase library. Check your connection and refresh the page.");
+    } else {
+      body = loading ? emptyState('Loading…') : views[route.name](route);
+    }
+    viewEl.innerHTML = error + body;
+    asideEl.innerHTML = loading || !sb ? '' : renderAside();
 
-    if (meId) {
+    if (!sb) {
+      navMeEl.innerHTML = '';
+    } else if (meId) {
       const me = getUser(meId);
       navMeEl.innerHTML = '<a class="nav-me-link" href="#/profile">' + avatar(me, 'sm') + '<div><strong>' + esc(me.name) + '</strong><span class="muted small">@' + esc(me.handle) + '</span></div></a>';
     } else {
@@ -637,14 +583,6 @@
     },
     'sign-out': async function () {
       await sb.auth.signOut();
-    },
-    'reset-data': function () {
-      if (!confirm('Reset all posts, threads and your profile to the demo data?')) return;
-      state = window.createSeedData();
-      saveLocalState();
-      ui.drafts = {};
-      ui.editingProfile = false;
-      render();
     }
   };
 
