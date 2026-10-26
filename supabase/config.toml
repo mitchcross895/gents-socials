@@ -1,0 +1,3 @@
+# Supabase CLI / GitHub integration settings.
+# Database changes live in supabase/migrations and are applied in filename order.
+project_id = "gents-socials"

@@ -189,7 +189,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   min-height: 40px; padding: 0 16px;
   border: 1px solid var(--border); border-radius: 999px;
   background: var(--surface); color: var(--text);
-  font-weight: 600; cursor: pointer; white-space: nowrap;
+  font-weight: 600; cursor: pointer; white-space: nowrap; text-decoration: none;
   transition: background-color 0.15s, border-color 0.15s;
 }
 .btn:hover { background: var(--surface-2); }
@@ -388,6 +388,25 @@ a.byline-name:hover { text-decoration: underline; }
 
 .reset-note { margin-top: 24px; text-align: center; }
 
+/* Notices & sign-in */
+.notice {
+  padding: 10px 14px; margin-bottom: 16px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft); color: var(--text); font-size: 0.95rem;
+}
+.notice-error {
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+  color: var(--danger);
+}
+.auth-form .notice { margin-bottom: 0; }
+.auth-switch { text-align: center; }
+
+.signin-prompt {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 16px; margin-bottom: 16px;
+}
+.comments .muted a { font-weight: 600; }
+
 /* Aside */
 .aside-card { padding: 16px; }
 .aside-card h2 { font-size: 1rem; margin-bottom: 12px; }
@@ -453,6 +472,7 @@ a.byline-name:hover { text-decoration: underline; }
   }
   .nav-me-link:hover { background: var(--surface-2); }
   .nav-me-link strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-signin { width: 100%; }
 }
 
 /* ---------- Wide: right panel ---------- */

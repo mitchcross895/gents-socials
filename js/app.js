@@ -2,7 +2,6 @@
   'use strict';
 
   const STORAGE_KEY = 'gents-socials:v1';
-  const ME = 'me';
   const MAX_POST = 500;
   const CATEGORIES = ['General', 'Style', 'Fitness', 'Career', 'Off-topic'];
   const AVATAR_COLORS = ['#9a6b1f', '#2f6f8f', '#5b7f3a', '#8a4b8f', '#b4492f', '#3d4a5c'];
@@ -39,9 +38,16 @@
 
   darkQuery.addEventListener('change', syncThemeControls);
 
-  // ---------- Storage (browser-only until a database exists) ----------
+  // ---------- Data source ----------
+  // With Supabase configured in js/config.js, data lives in the database and members sign in.
+  // Without it, the site runs in demo mode: seed data saved to this browser only.
 
-  function loadState() {
+  const config = window.GENTS_CONFIG || {};
+  const sb = config.supabaseUrl && config.supabaseKey && window.supabase
+    ? window.supabase.createClient(config.supabaseUrl, config.supabaseKey)
+    : null;
+
+  function loadLocalState() {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
       if (saved && saved.version === 1) return saved;
@@ -49,11 +55,13 @@
     return window.createSeedData();
   }
 
-  function saveState() {
+  function saveLocalState() {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* ignore */ }
   }
 
-  let state = loadState();
+  let state = sb ? { users: {}, posts: [], threads: [] } : loadLocalState();
+  let meId = sb ? null : 'me'; // signed-in user's id; null when signed out
+  let loading = !!sb;
 
   // Transient UI state (not persisted)
   const ui = {
@@ -62,8 +70,148 @@
     showNewThread: false,
     editingProfile: false,
     profileTab: 'posts',
+    authMode: 'signin',
+    authNotice: '',
+    error: '',
     drafts: {}
   };
+
+  async function query(request) {
+    const result = await request;
+    if (result.error) throw result.error;
+    return result.data;
+  }
+
+  function toEntry(row) {
+    return { id: row.id, authorId: row.author_id, text: row.body, createdAt: Date.parse(row.created_at) };
+  }
+
+  async function loadRemoteState() {
+    const results = await Promise.all([
+      query(sb.from('profiles').select('id, name, handle, bio, color')),
+      query(sb.from('posts')
+        .select('id, author_id, body, created_at, post_likes(user_id), comments(id, author_id, body, created_at)')
+        .order('created_at', { ascending: false })
+        .order('created_at', { referencedTable: 'comments', ascending: true })
+        .limit(200)),
+      query(sb.from('threads')
+        .select('id, author_id, category, title, body, created_at, replies(id, author_id, body, created_at)')
+        .order('created_at', { referencedTable: 'replies', ascending: true }))
+    ]);
+    const profiles = results[0], posts = results[1], threads = results[2];
+
+    state = {
+      users: Object.fromEntries(profiles.map(function (p) { return [p.id, p]; })),
+      posts: posts.map(function (p) {
+        return Object.assign(toEntry(p), {
+          likes: p.post_likes.map(function (l) { return l.user_id; }),
+          comments: p.comments.map(toEntry)
+        });
+      }),
+      threads: threads.map(function (t) {
+        return { id: t.id, authorId: t.author_id, category: t.category, title: t.title, body: t.body, createdAt: Date.parse(t.created_at), replies: t.replies.map(toEntry) };
+      })
+    };
+  }
+
+  function reload() {
+    return loadRemoteState()
+      .catch(function (err) { ui.error = describeError(err); })
+      .finally(function () { loading = false; render(); });
+  }
+
+  // Both data sources expose the same operations
+  const localApi = {
+    createPost: async function (text) {
+      state.posts.push({ id: uid('p'), authorId: meId, text: text, createdAt: Date.now(), likes: [], comments: [] });
+      saveLocalState();
+    },
+    toggleLike: async function (post) {
+      const i = post.likes.indexOf(meId);
+      if (i === -1) post.likes.push(meId); else post.likes.splice(i, 1);
+      saveLocalState();
+    },
+    deletePost: async function (post) {
+      state.posts = state.posts.filter(function (p) { return p !== post; });
+      saveLocalState();
+    },
+    addComment: async function (post, text) {
+      post.comments.push({ id: uid('c'), authorId: meId, text: text, createdAt: Date.now() });
+      saveLocalState();
+    },
+    createThread: async function (fields) {
+      const thread = Object.assign({ id: uid('t'), authorId: meId, createdAt: Date.now(), replies: [] }, fields);
+      state.threads.push(thread);
+      saveLocalState();
+      return thread.id;
+    },
+    addReply: async function (thread, text) {
+      thread.replies.push({ id: uid('r'), authorId: meId, text: text, createdAt: Date.now() });
+      saveLocalState();
+    },
+    deleteThread: async function (id) {
+      state.threads = state.threads.filter(function (t) { return t.id !== id; });
+      saveLocalState();
+    },
+    saveProfile: async function (fields) {
+      const taken = Object.values(state.users).some(function (u) { return u.id !== meId && u.handle === fields.handle; });
+      if (taken) throw { code: '23505' };
+      Object.assign(state.users[meId], fields);
+      saveLocalState();
+    }
+  };
+
+  const remoteApi = {
+    createPost: function (text) {
+      return query(sb.from('posts').insert({ body: text }));
+    },
+    toggleLike: function (post) {
+      return post.likes.includes(meId)
+        ? query(sb.from('post_likes').delete().match({ post_id: post.id, user_id: meId }))
+        : query(sb.from('post_likes').insert({ post_id: post.id }));
+    },
+    deletePost: function (post) {
+      return query(sb.from('posts').delete().eq('id', post.id));
+    },
+    addComment: function (post, text) {
+      return query(sb.from('comments').insert({ post_id: post.id, body: text }));
+    },
+    createThread: async function (fields) {
+      const row = await query(sb.from('threads').insert(fields).select('id').single());
+      return row.id;
+    },
+    addReply: function (thread, text) {
+      return query(sb.from('replies').insert({ thread_id: thread.id, body: text }));
+    },
+    deleteThread: function (id) {
+      return query(sb.from('threads').delete().eq('id', id));
+    },
+    saveProfile: function (fields) {
+      return query(sb.from('profiles').update(fields).eq('id', meId));
+    }
+  };
+
+  const api = sb ? remoteApi : localApi;
+
+  // Runs a data operation, refreshes from the database, and re-renders. Resolves true on success.
+  async function run(task) {
+    ui.error = '';
+    try {
+      await task();
+      if (sb) await loadRemoteState();
+      return true;
+    } catch (err) {
+      ui.error = describeError(err);
+      return false;
+    } finally {
+      render();
+    }
+  }
+
+  function describeError(err) {
+    if (err && err.code === '23505') return 'That handle is already taken.';
+    return (err && err.message) || 'Something went wrong. Please try again.';
+  }
 
   // ---------- Helpers ----------
 
@@ -81,7 +229,7 @@
   }
 
   function getUser(id) {
-    return state.users[id] || { id: id, name: 'Unknown', handle: 'unknown', color: AVATAR_COLORS[5] };
+    return state.users[id] || { id: id, name: 'Unknown', handle: 'unknown', bio: '', color: AVATAR_COLORS[5] };
   }
 
   function timeAgo(ts) {
@@ -106,7 +254,7 @@
   }
 
   function byline(user, ts) {
-    const name = user.id === ME
+    const name = meId && user.id === meId
       ? '<a class="byline-name" href="#/profile">' + esc(user.name) + '</a>'
       : '<span class="byline-name">' + esc(user.name) + '</span>';
     return '<div class="byline">' + name +
@@ -126,37 +274,51 @@
     return esc(ui.drafts[key] || '');
   }
 
+  // Sends signed-out visitors to the sign-in form. Returns true if already signed in.
+  function requireSignIn() {
+    if (meId) return true;
+    ui.authMode = 'signin';
+    ui.authNotice = 'Sign in to join the conversation.';
+    if (location.hash === '#/profile') render(); else location.hash = '#/profile';
+    return false;
+  }
+
   // ---------- Views ----------
 
   function viewHeader(title, extra) {
     return '<header class="view-header"><h1>' + esc(title) + '</h1>' + (extra || '') + '</header>';
   }
 
-  function renderPosts() {
-    const me = getUser(ME);
-    const posts = state.posts.slice().sort(function (a, b) { return b.createdAt - a.createdAt; });
+  function signInPrompt(message) {
+    return '<div class="card signin-prompt"><p>' + esc(message) + '</p><a class="btn btn-primary" href="#/profile">Sign in</a></div>';
+  }
 
-    return viewHeader('Posts') +
-      '<form class="card composer" data-submit="create-post">' +
-        avatar(me) +
-        '<div class="composer-main">' +
-          '<label class="sr-only" for="composer-text">Write a post</label>' +
-          '<textarea id="composer-text" name="text" rows="3" maxlength="' + MAX_POST + '" data-draft="post" data-counter="post-count" placeholder="What\'s on your mind?" required>' + draft('post') + '</textarea>' +
-          '<div class="composer-foot"><span class="muted small" id="post-count">' + (ui.drafts.post || '').length + '/' + MAX_POST + '</span>' +
-          '<button class="btn btn-primary" type="submit">Post</button></div>' +
-        '</div>' +
-      '</form>' +
+  function renderPosts() {
+    const posts = state.posts.slice().sort(function (a, b) { return b.createdAt - a.createdAt; });
+    const composer = meId
+      ? '<form class="card composer" data-submit="create-post">' +
+          avatar(getUser(meId)) +
+          '<div class="composer-main">' +
+            '<label class="sr-only" for="composer-text">Write a post</label>' +
+            '<textarea id="composer-text" name="text" rows="3" maxlength="' + MAX_POST + '" data-draft="post" data-counter="post-count" placeholder="What\'s on your mind?" required>' + draft('post') + '</textarea>' +
+            '<div class="composer-foot"><span class="muted small" id="post-count">' + (ui.drafts.post || '').length + '/' + MAX_POST + '</span>' +
+            '<button class="btn btn-primary" type="submit">Post</button></div>' +
+          '</div>' +
+        '</form>'
+      : signInPrompt('Sign in to share a post with the community.');
+
+    return viewHeader('Posts') + composer +
       '<div class="stack">' + (posts.length ? posts.map(postCard).join('') : emptyState('No posts yet. Be the first to share something.')) + '</div>';
   }
 
   function postCard(post) {
     const author = getUser(post.authorId);
-    const liked = post.likes.includes(ME);
+    const liked = !!meId && post.likes.includes(meId);
     const open = ui.openComments.has(post.id);
 
     return '<article class="card post" data-post="' + esc(post.id) + '">' +
       '<header class="post-head">' + avatar(author) + byline(author, post.createdAt) +
-        (post.authorId === ME ? '<button class="icon-btn" data-action="delete-post" aria-label="Delete post">' + ICONS.trash + '</button>' : '') +
+        (meId && post.authorId === meId ? '<button class="icon-btn" data-action="delete-post" aria-label="Delete post">' + ICONS.trash + '</button>' : '') +
       '</header>' +
       '<p class="post-body">' + esc(post.text) + '</p>' +
       '<footer class="post-actions">' +
@@ -174,12 +336,14 @@
         const u = getUser(c.authorId);
         return '<div class="comment">' + avatar(u, 'sm') + '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div></div>';
       }).join('') +
-      '<form class="inline-form" data-submit="add-comment" data-post="' + esc(post.id) + '">' +
-        avatar(getUser(ME), 'sm') +
-        '<label class="sr-only" for="' + esc(key) + '">Write a comment</label>' +
-        '<input id="' + esc(key) + '" name="text" maxlength="300" autocomplete="off" placeholder="Write a comment…" data-draft="' + esc(key) + '" value="' + draft(key) + '" required>' +
-        '<button class="btn btn-small" type="submit">Reply</button>' +
-      '</form>' +
+      (meId
+        ? '<form class="inline-form" data-submit="add-comment" data-post="' + esc(post.id) + '">' +
+            avatar(getUser(meId), 'sm') +
+            '<label class="sr-only" for="' + esc(key) + '">Write a comment</label>' +
+            '<input id="' + esc(key) + '" name="text" maxlength="300" autocomplete="off" placeholder="Write a comment…" data-draft="' + esc(key) + '" value="' + draft(key) + '" required>' +
+            '<button class="btn btn-small" type="submit">Reply</button>' +
+          '</form>'
+        : '<p class="muted small"><a href="#/profile">Sign in</a> to comment.</p>') +
     '</section>';
   }
 
@@ -191,7 +355,7 @@
     const newBtn = '<button class="btn btn-primary" data-action="toggle-new-thread" aria-expanded="' + ui.showNewThread + '">' + ICONS.plus + '<span>New thread</span></button>';
 
     return viewHeader('Forum', newBtn) +
-      (ui.showNewThread ? newThreadForm() : '') +
+      (ui.showNewThread && meId ? newThreadForm() : '') +
       '<div class="chips" role="group" aria-label="Filter by category">' +
         ['All'].concat(CATEGORIES).map(function (c) {
           return '<button class="chip" data-action="filter-category" data-category="' + esc(c) + '" aria-pressed="' + (ui.forumCategory === c) + '">' + esc(c) + '</button>';
@@ -240,7 +404,7 @@
         '<span class="badge">' + esc(thread.category) + '</span>' +
         '<h1 class="thread-title">' + esc(thread.title) + '</h1>' +
         '<header class="post-head">' + avatar(author) + byline(author, thread.createdAt) +
-          (thread.authorId === ME ? '<button class="icon-btn" data-action="delete-thread" aria-label="Delete thread">' + ICONS.trash + '</button>' : '') +
+          (meId && thread.authorId === meId ? '<button class="icon-btn" data-action="delete-thread" aria-label="Delete thread">' + ICONS.trash + '</button>' : '') +
         '</header>' +
         '<p class="post-body">' + esc(thread.body) + '</p>' +
       '</article>' +
@@ -251,16 +415,20 @@
           return '<div class="card reply"><header class="post-head">' + avatar(u, 'sm') + byline(u, r.createdAt) + '</header><p class="post-body">' + esc(r.text) + '</p></div>';
         }).join('') +
       '</div>' +
-      '<form class="card form" data-submit="add-reply" data-thread="' + esc(thread.id) + '">' +
-        '<label class="field"><span>Your reply</span><textarea name="text" rows="3" maxlength="2000" required data-draft="' + esc(key) + '">' + draft(key) + '</textarea></label>' +
-        '<div class="form-actions"><button class="btn btn-primary" type="submit">Post reply</button></div>' +
-      '</form>';
+      (meId
+        ? '<form class="card form" data-submit="add-reply" data-thread="' + esc(thread.id) + '">' +
+            '<label class="field"><span>Your reply</span><textarea name="text" rows="3" maxlength="2000" required data-draft="' + esc(key) + '">' + draft(key) + '</textarea></label>' +
+            '<div class="form-actions"><button class="btn btn-primary" type="submit">Post reply</button></div>' +
+          '</form>'
+        : signInPrompt('Sign in to reply to this thread.'));
   }
 
   function renderProfile() {
-    const me = getUser(ME);
-    const myPosts = state.posts.filter(function (p) { return p.authorId === ME; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
-    const myThreads = state.threads.filter(function (t) { return t.authorId === ME; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
+    if (!meId) return renderAuth();
+
+    const me = getUser(meId);
+    const myPosts = state.posts.filter(function (p) { return p.authorId === meId; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
+    const myThreads = state.threads.filter(function (t) { return t.authorId === meId; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
     const likes = myPosts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
     const color = AVATAR_COLORS.includes(me.color) ? me.color : AVATAR_COLORS[0];
 
@@ -270,6 +438,10 @@
     } else {
       list = myThreads.length ? '<div class="card thread-list">' + myThreads.map(threadRow).join('') + '</div>' : emptyState('You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.');
     }
+
+    const footer = sb
+      ? '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>'
+      : '<p class="reset-note muted small">Demo mode: data is saved in this browser only. <button class="link-btn" data-action="reset-data">Reset demo data</button></p>';
 
     return viewHeader('Profile') +
       '<section class="card profile">' +
@@ -293,8 +465,7 @@
         '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="posts" aria-selected="' + (ui.profileTab === 'posts') + '">My posts</button>' +
         '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="threads" aria-selected="' + (ui.profileTab === 'threads') + '">My threads</button>' +
       '</div>' +
-      list +
-      '<p class="reset-note muted small">Data is saved in this browser only. <button class="link-btn" data-action="reset-data">Reset demo data</button></p>';
+      list + footer;
   }
 
   function profileForm(me) {
@@ -307,25 +478,47 @@
           return '<label class="swatch" style="--avatar:' + c + '"><input type="radio" name="color" value="' + c + '"' + (c === me.color ? ' checked' : '') + '><span class="sr-only">' + c + '</span></label>';
         }).join('') +
       '</div></fieldset>' +
-      '<p class="form-error" id="profile-error" role="alert"></p>' +
       '<div class="form-actions"><button class="btn" type="button" data-action="cancel-edit">Cancel</button><button class="btn btn-primary" type="submit">Save</button></div>' +
     '</form>';
   }
 
+  function renderAuth() {
+    const signup = ui.authMode === 'signup';
+    return viewHeader('Profile') +
+      '<form class="card form auth-form" data-submit="' + (signup ? 'sign-up' : 'sign-in') + '">' +
+        '<h2>' + (signup ? 'Create your account' : 'Sign in') + '</h2>' +
+        '<p class="muted">' + (signup ? 'Join to post, comment and start forum threads.' : 'Welcome back. Sign in to post and reply.') + '</p>' +
+        (ui.authNotice ? '<p class="notice">' + esc(ui.authNotice) + '</p>' : '') +
+        (signup
+          ? '<label class="field"><span>Name</span><input name="name" maxlength="40" autocomplete="name" required></label>' +
+            '<label class="field"><span>Handle</span><input name="handle" maxlength="15" pattern="[A-Za-z0-9_]+" title="Letters, numbers and underscores only" autocomplete="username" required></label>'
+          : '') +
+        '<label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" required></label>' +
+        '<label class="field"><span>Password</span><input name="password" type="password" minlength="6" autocomplete="' + (signup ? 'new-password' : 'current-password') + '" required></label>' +
+        '<div class="form-actions"><button class="btn btn-primary" type="submit">' + (signup ? 'Create account' : 'Sign in') + '</button></div>' +
+        '<p class="small muted auth-switch">' + (signup ? 'Already have an account? ' : 'New here? ') +
+          '<button type="button" class="link-btn" data-action="auth-mode" data-mode="' + (signup ? 'signin' : 'signup') + '">' + (signup ? 'Sign in' : 'Create an account') + '</button></p>' +
+      '</form>';
+  }
+
   function renderAside() {
     const popular = state.threads.slice().sort(function (a, b) { return b.replies.length - a.replies.length; }).slice(0, 3);
-    const members = Object.values(state.users).filter(function (u) { return u.id !== ME; });
+    const members = Object.values(state.users).filter(function (u) { return u.id !== meId; });
 
-    return '<section class="card aside-card"><h2>Popular threads</h2><ol class="aside-list">' +
-        popular.map(function (t) {
-          return '<li><a href="#/forum/' + encodeURIComponent(t.id) + '">' + esc(t.title) + '</a><span class="muted small">' + esc(t.category) + ' · ' + plural(t.replies.length, 'reply', 'replies') + '</span></li>';
-        }).join('') +
-      '</ol></section>' +
-      '<section class="card aside-card"><h2>Members</h2><ul class="member-list">' +
-        members.map(function (u) {
-          return '<li>' + avatar(u, 'sm') + '<div><strong>' + esc(u.name) + '</strong><span class="muted small">@' + esc(u.handle) + '</span></div></li>';
-        }).join('') +
-      '</ul></section>';
+    return '<section class="card aside-card"><h2>Popular threads</h2>' +
+        (popular.length
+          ? '<ol class="aside-list">' + popular.map(function (t) {
+              return '<li><a href="#/forum/' + encodeURIComponent(t.id) + '">' + esc(t.title) + '</a><span class="muted small">' + esc(t.category) + ' · ' + plural(t.replies.length, 'reply', 'replies') + '</span></li>';
+            }).join('') + '</ol>'
+          : '<p class="muted small">No threads yet.</p>') +
+      '</section>' +
+      '<section class="card aside-card"><h2>Members</h2>' +
+        (members.length
+          ? '<ul class="member-list">' + members.map(function (u) {
+              return '<li>' + avatar(u, 'sm') + '<div><strong>' + esc(u.name) + '</strong><span class="muted small">@' + esc(u.handle) + '</span></div></li>';
+            }).join('') + '</ul>'
+          : '<p class="muted small">No other members yet.</p>') +
+      '</section>';
   }
 
   function emptyState(html) {
@@ -350,23 +543,23 @@
   function render() {
     const route = parseRoute();
     const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile };
-    viewEl.innerHTML = views[route.name](route);
-    asideEl.innerHTML = renderAside();
+    const error = ui.error ? '<p class="notice notice-error" role="alert">' + esc(ui.error) + '</p>' : '';
+    viewEl.innerHTML = error + (loading ? emptyState('Loading…') : views[route.name](route));
+    asideEl.innerHTML = loading ? '' : renderAside();
 
-    const me = getUser(ME);
-    navMeEl.innerHTML = '<a class="nav-me-link" href="#/profile">' + avatar(me, 'sm') + '<div><strong>' + esc(me.name) + '</strong><span class="muted small">@' + esc(me.handle) + '</span></div></a>';
+    if (meId) {
+      const me = getUser(meId);
+      navMeEl.innerHTML = '<a class="nav-me-link" href="#/profile">' + avatar(me, 'sm') + '<div><strong>' + esc(me.name) + '</strong><span class="muted small">@' + esc(me.handle) + '</span></div></a>';
+    } else {
+      navMeEl.innerHTML = loading ? '' : '<a class="btn btn-primary nav-signin" href="#/profile">Sign in</a>';
+    }
 
     document.querySelectorAll('[data-tab]').forEach(function (link) {
       if (link.dataset.tab === route.tab) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     });
     titleEl.textContent = TITLES[route.tab];
-    document.title = TITLES[route.tab] + ' · Gents Socials';
-  }
-
-  function commit() {
-    saveState();
-    render();
+    document.title = TITLES[route.tab] + ' · gentcore';
   }
 
   // ---------- Actions ----------
@@ -374,6 +567,10 @@
   function findPost(el) {
     const id = el.closest('[data-post]').dataset.post;
     return state.posts.find(function (p) { return p.id === id; });
+  }
+
+  function lockForm(form) {
+    form.querySelectorAll('button, input, textarea, select').forEach(function (el) { el.disabled = true; });
   }
 
   const actions = {
@@ -384,10 +581,10 @@
       syncThemeControls();
     },
     like: function (el) {
+      if (!requireSignIn()) return;
       const post = findPost(el);
-      const i = post.likes.indexOf(ME);
-      if (i === -1) post.likes.push(ME); else post.likes.splice(i, 1);
-      commit();
+      el.disabled = true;
+      run(function () { return api.toggleLike(post); });
     },
     'toggle-comments': function (el) {
       const id = findPost(el).id;
@@ -401,10 +598,10 @@
     'delete-post': function (el) {
       if (!confirm('Delete this post?')) return;
       const post = findPost(el);
-      state.posts = state.posts.filter(function (p) { return p !== post; });
-      commit();
+      run(function () { return api.deletePost(post); });
     },
     'toggle-new-thread': function () {
+      if (!requireSignIn()) return;
       ui.showNewThread = !ui.showNewThread;
       render();
       if (ui.showNewThread) viewEl.querySelector('[name="title"]').focus();
@@ -413,12 +610,10 @@
       ui.forumCategory = el.dataset.category;
       render();
     },
-    'delete-thread': function (el) {
+    'delete-thread': async function (el) {
       if (!confirm('Delete this thread and all its replies?')) return;
       const id = el.closest('[data-thread]').dataset.thread;
-      state.threads = state.threads.filter(function (t) { return t.id !== id; });
-      saveState();
-      location.hash = '#/forum';
+      if (await run(function () { return api.deleteThread(id); })) location.hash = '#/forum';
     },
     'edit-profile': function () {
       ui.editingProfile = true;
@@ -427,72 +622,114 @@
     },
     'cancel-edit': function () {
       ui.editingProfile = false;
+      ui.error = '';
       render();
     },
     'profile-tab': function (el) {
       ui.profileTab = el.dataset.tabName;
       render();
     },
+    'auth-mode': function (el) {
+      ui.authMode = el.dataset.mode;
+      ui.authNotice = '';
+      ui.error = '';
+      render();
+    },
+    'sign-out': async function () {
+      await sb.auth.signOut();
+    },
     'reset-data': function () {
       if (!confirm('Reset all posts, threads and your profile to the demo data?')) return;
       state = window.createSeedData();
+      saveLocalState();
       ui.drafts = {};
       ui.editingProfile = false;
-      commit();
+      render();
     }
   };
 
   const submits = {
-    'create-post': function (form, data) {
+    'create-post': async function (form, data) {
       const text = data.get('text').trim();
       if (!text) return;
-      state.posts.push({ id: uid('p'), authorId: ME, text: text, createdAt: Date.now(), likes: [], comments: [] });
-      delete ui.drafts.post;
-      commit();
+      lockForm(form);
+      if (await run(function () { return api.createPost(text); })) {
+        delete ui.drafts.post;
+        render();
+      }
     },
-    'add-comment': function (form, data) {
+    'add-comment': async function (form, data) {
       const text = data.get('text').trim();
       const post = state.posts.find(function (p) { return p.id === form.dataset.post; });
       if (!text || !post) return;
-      post.comments.push({ id: uid('c'), authorId: ME, text: text, createdAt: Date.now() });
-      delete ui.drafts['comment-' + post.id];
-      commit();
+      lockForm(form);
+      if (await run(function () { return api.addComment(post, text); })) {
+        delete ui.drafts['comment-' + post.id];
+        render();
+      }
     },
-    'create-thread': function (form, data) {
-      const title = data.get('title').trim();
-      const body = data.get('body').trim();
-      if (!title || !body) return;
-      const thread = { id: uid('t'), category: data.get('category'), authorId: ME, title: title, body: body, createdAt: Date.now(), replies: [] };
-      state.threads.push(thread);
-      delete ui.drafts['thread-title'];
-      delete ui.drafts['thread-body'];
-      ui.showNewThread = false;
-      saveState();
-      location.hash = '#/forum/' + encodeURIComponent(thread.id);
+    'create-thread': async function (form, data) {
+      const fields = { category: data.get('category'), title: data.get('title').trim(), body: data.get('body').trim() };
+      if (!fields.title || !fields.body) return;
+      lockForm(form);
+      let id;
+      if (await run(async function () { id = await api.createThread(fields); })) {
+        delete ui.drafts['thread-title'];
+        delete ui.drafts['thread-body'];
+        ui.showNewThread = false;
+        location.hash = '#/forum/' + encodeURIComponent(id);
+      }
     },
-    'add-reply': function (form, data) {
+    'add-reply': async function (form, data) {
       const text = data.get('text').trim();
       const thread = state.threads.find(function (t) { return t.id === form.dataset.thread; });
       if (!text || !thread) return;
-      thread.replies.push({ id: uid('r'), authorId: ME, text: text, createdAt: Date.now() });
-      delete ui.drafts['reply-' + thread.id];
-      commit();
-    },
-    'save-profile': function (form, data) {
-      const name = data.get('name').trim();
-      const handle = data.get('handle').trim().toLowerCase();
-      const taken = Object.values(state.users).some(function (u) { return u.id !== ME && u.handle === handle; });
-      if (taken) {
-        form.querySelector('#profile-error').textContent = '@' + handle + ' is already taken.';
-        return;
+      lockForm(form);
+      if (await run(function () { return api.addReply(thread, text); })) {
+        delete ui.drafts['reply-' + thread.id];
+        render();
       }
-      const me = state.users[ME];
-      me.name = name;
-      me.handle = handle;
-      me.bio = data.get('bio').trim();
-      if (AVATAR_COLORS.includes(data.get('color'))) me.color = data.get('color');
+    },
+    'save-profile': async function (form, data) {
+      const fields = {
+        name: data.get('name').trim(),
+        handle: data.get('handle').trim().toLowerCase(),
+        bio: data.get('bio').trim()
+      };
+      if (AVATAR_COLORS.includes(data.get('color'))) fields.color = data.get('color');
       ui.editingProfile = false;
-      commit();
+      if (!(await run(function () { return api.saveProfile(fields); }))) {
+        ui.editingProfile = true; // keep the form open so the error can be fixed
+        render();
+      }
+    },
+    'sign-in': async function (form, data) {
+      lockForm(form);
+      const result = await sb.auth.signInWithPassword({ email: data.get('email'), password: data.get('password') });
+      if (result.error) {
+        ui.error = result.error.message;
+        render();
+      }
+      // On success, onAuthStateChange loads the signed-in view
+    },
+    'sign-up': async function (form, data) {
+      lockForm(form);
+      const result = await sb.auth.signUp({
+        email: data.get('email'),
+        password: data.get('password'),
+        options: {
+          data: { name: data.get('name').trim(), handle: data.get('handle').trim().toLowerCase() },
+          emailRedirectTo: location.origin + location.pathname
+        }
+      });
+      if (result.error) {
+        ui.error = result.error.message;
+      } else if (!result.data.session) {
+        ui.error = '';
+        ui.authMode = 'signin';
+        ui.authNotice = 'Almost there! Check your email for a confirmation link, then sign in.';
+      }
+      render();
     }
   };
 
@@ -521,10 +758,29 @@
 
   window.addEventListener('hashchange', function () {
     ui.editingProfile = false;
+    ui.error = '';
     render();
     window.scrollTo(0, 0);
     viewEl.focus({ preventScroll: true });
   });
+
+  if (sb) {
+    sb.auth.onAuthStateChange(function (event, session) {
+      const id = session ? session.user.id : null;
+      if (!loading && id === meId) return; // e.g. token refresh
+      meId = id;
+      ui.editingProfile = false;
+      ui.error = '';
+      if (id) ui.authNotice = '';
+      // Defer: calling Supabase from inside this callback can deadlock
+      setTimeout(reload, 0);
+    });
+
+    // Pick up new posts when someone comes back to the tab
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && !loading && !ui.editingProfile) reload();
+    });
+  }
 
   render();
   syncThemeControls();

@@ -75,7 +75,7 @@ window.createSeedData = function () {
       {
         id: 't4', category: 'General', authorId: 'sam', createdAt: now - 5 * day,
         title: 'Welcome! Introduce yourself here',
-        body: 'New to Gents Socials? Drop a quick intro: where you are from and what you are into.',
+        body: 'New to gentcore? Drop a quick intro: where you are from and what you are into.',
         replies: [
           { id: 'r4', authorId: 'james', text: 'James here, from Chicago. Into tailoring and good coffee.', createdAt: now - 4.5 * day },
           { id: 'r5', authorId: 'marcus', text: 'Marcus, Austin TX. Gym, grill, repeat.', createdAt: now - 4 * day }
