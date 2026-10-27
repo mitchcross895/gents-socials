@@ -4,8 +4,10 @@
   const MAX_POST = 500;
   const CATEGORIES = ['General', 'Style', 'Fitness', 'Career', 'Off-topic'];
   const AVATAR_COLORS = ['#9a6b1f', '#2f6f8f', '#5b7f3a', '#8a4b8f', '#b4492f', '#3d4a5c'];
-  const IMAGE_BUCKET = 'profile-images';
-  const IMAGE_SIZES = { avatar: [400, 400], banner: [1500, 500] }; // uploads are cropped to these
+  const PROFILE_BUCKET = 'profile-images';
+  const POST_BUCKET = 'post-images';
+  const IMAGE_SIZES = { avatar: [400, 400], banner: [1500, 500] }; // profile uploads are cropped to these
+  const POST_IMAGE_MAX_SIDE = 1600; // post photos are shrunk to fit, not cropped
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // before resizing
   const TITLES = { posts: 'Posts', forum: 'Forum', profile: 'Profile' };
 
@@ -16,7 +18,9 @@
     plus: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
     back: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>',
     sun: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>',
-    moon: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
+    moon: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+    image: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
+    close: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>'
   };
 
   // ---------- Theme (light/dark, remembered per browser) ----------
@@ -61,8 +65,16 @@
     authMode: 'signin',
     authNotice: '',
     error: '',
-    drafts: {}
+    drafts: {},
+    postImage: null,       // File chosen for the post being written
+    postImagePreview: ''   // object URL for its preview
   };
+
+  function setPostImage(file) {
+    if (ui.postImagePreview) URL.revokeObjectURL(ui.postImagePreview);
+    ui.postImage = file;
+    ui.postImagePreview = file ? URL.createObjectURL(file) : '';
+  }
 
   async function query(request) {
     const result = await request;
@@ -78,7 +90,7 @@
     const results = await Promise.all([
       query(sb.from('profiles').select('id, name, handle, bio, color, avatar_path, banner_path')),
       query(sb.from('posts')
-        .select('id, author_id, body, created_at, post_likes(user_id), comments(id, author_id, body, created_at, comment_likes(user_id))')
+        .select('id, author_id, body, image_path, created_at, post_likes(user_id), comments(id, author_id, body, created_at, comment_likes(user_id))')
         .order('created_at', { ascending: false })
         .order('created_at', { referencedTable: 'comments', ascending: true })
         .limit(200)),
@@ -90,10 +102,12 @@
 
     state = {
       users: Object.fromEntries(profiles.map(function (p) {
-        return [p.id, Object.assign(p, { avatarUrl: imageUrl(p.avatar_path), bannerUrl: imageUrl(p.banner_path) })];
+        return [p.id, Object.assign(p, { avatarUrl: imageUrl(PROFILE_BUCKET, p.avatar_path), bannerUrl: imageUrl(PROFILE_BUCKET, p.banner_path) })];
       })),
       posts: posts.map(function (p) {
         return Object.assign(toEntry(p), {
+          imagePath: p.image_path,
+          imageUrl: imageUrl(POST_BUCKET, p.image_path),
           likes: p.post_likes.map(function (l) { return l.user_id; }),
           comments: p.comments.map(function (c) {
             return Object.assign(toEntry(c), { likes: c.comment_likes.map(function (l) { return l.user_id; }) });
@@ -106,13 +120,20 @@
     };
   }
 
-  function imageUrl(path) {
-    return path ? sb.storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl : '';
+  function imageUrl(bucket, path) {
+    return path ? sb.storage.from(bucket).getPublicUrl(path).data.publicUrl : '';
   }
 
-  // Center-crops an image file to width×height and re-encodes it as JPEG.
+  // Returns an error message if the file can't be used as an image upload, or '' if it's fine
+  function checkImageFile(file) {
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type)) return 'Please choose a JPG, PNG or WebP image.';
+    if (file.size > MAX_UPLOAD_BYTES) return 'That image is over 10 MB. Please choose a smaller one.';
+    return '';
+  }
+
+  // Draws an image file onto a canvas laid out by layout(width, height) and re-encodes it as JPEG.
   // Keeps uploads small and drops hidden metadata such as photo GPS location.
-  async function resizeImage(file, width, height) {
+  async function processImage(file, layout) {
     const url = URL.createObjectURL(file);
     try {
       const img = await new Promise(function (resolve, reject) {
@@ -121,15 +142,14 @@
         i.onerror = function () { reject(new Error('That image couldn\'t be read. Try a JPG or PNG.')); };
         i.src = url;
       });
-      const scale = Math.max(width / img.naturalWidth, height / img.naturalHeight);
-      const sw = width / scale, sh = height / scale;
+      const box = layout(img.naturalWidth, img.naturalHeight);
       const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
+      canvas.width = box.width;
+      canvas.height = box.height;
       const ctx = canvas.getContext('2d');
       ctx.fillStyle = '#ffffff'; // background for transparent PNGs
-      ctx.fillRect(0, 0, width, height);
-      ctx.drawImage(img, (img.naturalWidth - sw) / 2, (img.naturalHeight - sh) / 2, sw, sh, 0, 0, width, height);
+      ctx.fillRect(0, 0, box.width, box.height);
+      ctx.drawImage(img, box.sx, box.sy, box.sw, box.sh, 0, 0, box.width, box.height);
       return await new Promise(function (resolve, reject) {
         canvas.toBlob(function (blob) {
           if (blob) resolve(blob); else reject(new Error('That image couldn\'t be processed.'));
@@ -140,6 +160,23 @@
     }
   }
 
+  // Center-crops to exactly width×height (profile pictures and banners)
+  function cropImage(file, width, height) {
+    return processImage(file, function (w, h) {
+      const scale = Math.max(width / w, height / h);
+      const sw = width / scale, sh = height / scale;
+      return { width: width, height: height, sx: (w - sw) / 2, sy: (h - sh) / 2, sw: sw, sh: sh };
+    });
+  }
+
+  // Shrinks so the longest side is at most maxSide, keeping the whole picture (post photos)
+  function fitImage(file, maxSide) {
+    return processImage(file, function (w, h) {
+      const scale = Math.min(1, maxSide / Math.max(w, h));
+      return { width: Math.round(w * scale), height: Math.round(h * scale), sx: 0, sy: 0, sw: w, sh: h };
+    });
+  }
+
   function reload() {
     return loadRemoteState()
       .catch(function (err) { ui.error = describeError(err); })
@@ -147,8 +184,19 @@
   }
 
   const api = {
-    createPost: function (text) {
-      return query(sb.from('posts').insert({ body: text }));
+    createPost: async function (text, imageFile) {
+      let path = null;
+      if (imageFile) {
+        const blob = await fitImage(imageFile, POST_IMAGE_MAX_SIDE);
+        path = meId + '/' + Date.now() + '.jpg';
+        await query(sb.storage.from(POST_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+      }
+      try {
+        await query(sb.from('posts').insert({ body: text, image_path: path }));
+      } catch (err) {
+        if (path) sb.storage.from(POST_BUCKET).remove([path]); // don't leave an orphaned photo
+        throw err;
+      }
     },
     toggleLike: function (post) {
       return post.likes.includes(meId)
@@ -160,8 +208,9 @@
         ? query(sb.from('comment_likes').delete().match({ comment_id: comment.id, user_id: meId }))
         : query(sb.from('comment_likes').insert({ comment_id: comment.id }));
     },
-    deletePost: function (post) {
-      return query(sb.from('posts').delete().eq('id', post.id));
+    deletePost: async function (post) {
+      await query(sb.from('posts').delete().eq('id', post.id));
+      if (post.imagePath) sb.storage.from(POST_BUCKET).remove([post.imagePath]); // clean up without blocking
     },
     addComment: function (post, text) {
       return query(sb.from('comments').insert({ post_id: post.id, body: text }));
@@ -190,20 +239,20 @@
           if (image === 'remove') {
             fields[column] = null;
           } else {
-            const blob = await resizeImage(image, IMAGE_SIZES[kind][0], IMAGE_SIZES[kind][1]);
+            const blob = await cropImage(image, IMAGE_SIZES[kind][0], IMAGE_SIZES[kind][1]);
             const path = meId + '/' + kind + '-' + Date.now() + '.jpg';
-            await query(sb.storage.from(IMAGE_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+            await query(sb.storage.from(PROFILE_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
             uploaded.push(path);
             fields[column] = path;
           }
         }
         await query(sb.from('profiles').update(fields).eq('id', meId));
       } catch (err) {
-        if (uploaded.length) sb.storage.from(IMAGE_BUCKET).remove(uploaded); // don't leave orphaned files
+        if (uploaded.length) sb.storage.from(PROFILE_BUCKET).remove(uploaded); // don't leave orphaned files
         throw err;
       }
       // Old files are no longer referenced; clean up without blocking the save
-      if (replaced.length) sb.storage.from(IMAGE_BUCKET).remove(replaced);
+      if (replaced.length) sb.storage.from(PROFILE_BUCKET).remove(replaced);
     }
   };
 
@@ -313,9 +362,21 @@
           avatar(getUser(meId)) +
           '<div class="composer-main">' +
             '<label class="sr-only" for="composer-text">Write a post</label>' +
-            '<textarea id="composer-text" name="text" rows="3" maxlength="' + MAX_POST + '" data-draft="post" data-counter="post-count" placeholder="What\'s on your mind?" required>' + draft('post') + '</textarea>' +
-            '<div class="composer-foot"><span class="muted small" id="post-count">' + (ui.drafts.post || '').length + '/' + MAX_POST + '</span>' +
-            '<button class="btn btn-primary" type="submit">Post</button></div>' +
+            '<textarea id="composer-text" name="text" rows="3" maxlength="' + MAX_POST + '" data-draft="post" data-counter="post-count" placeholder="What\'s on your mind?">' + draft('post') + '</textarea>' +
+            (ui.postImagePreview
+              ? '<div class="composer-preview"><img src="' + esc(ui.postImagePreview) + '" alt="Selected photo">' +
+                  '<button type="button" class="preview-remove" data-action="remove-post-image" aria-label="Remove photo">' + ICONS.close + '</button></div>'
+              : '') +
+            '<div class="composer-foot">' +
+              '<div class="composer-tools">' +
+                '<label class="icon-btn composer-photo" title="Add a photo">' + ICONS.image +
+                  '<span class="sr-only">Add a photo</span>' +
+                  '<input class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" data-image-input="post">' +
+                '</label>' +
+                '<span class="muted small" id="post-count">' + (ui.drafts.post || '').length + '/' + MAX_POST + '</span>' +
+              '</div>' +
+              '<button class="btn btn-primary" type="submit">Post</button>' +
+            '</div>' +
           '</div>' +
         '</form>'
       : signInPrompt('Sign in to share a post with the community.');
@@ -333,7 +394,11 @@
       '<header class="post-head">' + avatar(author) + byline(author, post.createdAt) +
         (meId && post.authorId === meId ? '<button class="icon-btn" data-action="delete-post" aria-label="Delete post">' + ICONS.trash + '</button>' : '') +
       '</header>' +
-      '<p class="post-body">' + esc(post.text) + '</p>' +
+      (post.text ? '<p class="post-body">' + esc(post.text) + '</p>' : '') +
+      (post.imageUrl
+        ? '<a class="post-image" href="' + esc(post.imageUrl) + '" target="_blank" rel="noopener noreferrer">' +
+            '<img src="' + esc(post.imageUrl) + '" alt="Photo shared by ' + esc(author.name) + '" loading="lazy"></a>'
+        : '') +
       '<footer class="post-actions">' +
         '<button class="action' + (liked ? ' liked' : '') + '" data-action="like" aria-pressed="' + liked + '" aria-label="Like">' + ICONS.heart + '<span>' + post.likes.length + '</span></button>' +
         '<button class="action" data-action="toggle-comments" aria-expanded="' + open + '" aria-label="Comments">' + ICONS.comment + '<span>' + post.comments.length + '</span></button>' +
@@ -647,6 +712,10 @@
       const post = findPost(el);
       run(function () { return api.deletePost(post); });
     },
+    'remove-post-image': function () {
+      setPostImage(null);
+      render();
+    },
     'toggle-new-thread': function () {
       if (!requireSignIn()) return;
       ui.showNewThread = !ui.showNewThread;
@@ -690,10 +759,17 @@
   const submits = {
     'create-post': async function (form, data) {
       const text = data.get('text').trim();
-      if (!text) return;
+      const imageFile = ui.postImage;
+      if (!text && !imageFile) {
+        ui.error = 'Write something or add a photo to post.';
+        render();
+        return;
+      }
       lockForm(form);
-      if (await run(function () { return api.createPost(text); })) {
+      if (imageFile) form.querySelector('[type="submit"]').textContent = 'Posting…';
+      if (await run(function () { return api.createPost(text, imageFile); })) {
         delete ui.drafts.post;
+        setPostImage(null);
         render();
       }
     },
@@ -741,13 +817,9 @@
       for (const kind of ['avatar', 'banner']) {
         const file = data.get(kind);
         if (file && file.size) {
-          if (!/^image\/(jpeg|png|webp)$/.test(file.type)) {
-            ui.error = 'Please choose a JPG, PNG or WebP image.';
-            render();
-            return;
-          }
-          if (file.size > MAX_UPLOAD_BYTES) {
-            ui.error = 'That image is over 10 MB. Please choose a smaller one.';
+          const problem = checkImageFile(file);
+          if (problem) {
+            ui.error = problem;
             render();
             return;
           }
@@ -816,6 +888,16 @@
     const el = e.target;
     if (el.dataset.draft) ui.drafts[el.dataset.draft] = el.value;
     if (el.dataset.counter) document.getElementById(el.dataset.counter).textContent = el.value.length + '/' + el.maxLength;
+  });
+
+  // Photo picked in the post composer: check it and show a preview
+  document.addEventListener('change', function (e) {
+    const input = e.target;
+    if (input.dataset.imageInput !== 'post' || !input.files.length) return;
+    const file = input.files[0];
+    ui.error = checkImageFile(file);
+    if (!ui.error) setPostImage(file);
+    render();
   });
 
   window.addEventListener('hashchange', function () {
