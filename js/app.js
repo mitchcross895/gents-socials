@@ -558,6 +558,7 @@
   // ---------- Routing & rendering ----------
 
   const viewEl = document.getElementById('view');
+  const viewBodyEl = document.getElementById('view-body'); // page content; the footer after it stays put
   const asideEl = document.getElementById('aside');
   const titleEl = document.getElementById('topbar-title');
   const navMeEl = document.getElementById('nav-me');
@@ -582,7 +583,7 @@
     } else {
       body = loading ? emptyState('Loading…') : views[route.name](route);
     }
-    viewEl.innerHTML = error + body;
+    viewBodyEl.innerHTML = error + body;
     asideEl.innerHTML = loading || !sb ? '' : renderAside();
 
     if (!sb) {
