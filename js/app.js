@@ -54,6 +54,10 @@
   let state = { users: {}, posts: [], threads: [] };
   let meId = null; // signed-in user's id; null when signed out
   let loading = !!sb;
+  let reloading = null;  // in-flight reload, shared so overlapping calls make one request
+  let lastLoadedAt = 0;
+  const RELOAD_AFTER_MS = 60 * 1000; // minimum gap between refreshes when returning to the tab
+  const pendingLikes = new Set(); // ids of posts/comments with a like request in flight
 
   // Transient UI state (not persisted)
   const ui = {
@@ -82,42 +86,67 @@
     return result.data;
   }
 
+  // Columns fetched for each row type. Inserts and updates ask for the same columns back,
+  // so new rows can go straight into state without reloading everything.
+  const COLUMNS = {
+    profile: 'id, name, handle, bio, color, avatar_path, banner_path',
+    post: 'id, author_id, body, image_path, created_at',
+    comment: 'id, author_id, body, created_at',
+    thread: 'id, author_id, category, title, body, created_at'
+  };
+
+  // ---------- Database rows → app objects ----------
+
+  function likerIds(rows) {
+    return (rows || []).map(function (l) { return l.user_id; });
+  }
+
   function toEntry(row) {
     return { id: row.id, authorId: row.author_id, text: row.body, createdAt: Date.parse(row.created_at) };
   }
 
+  function toUser(row) {
+    return Object.assign(row, { avatarUrl: imageUrl(PROFILE_BUCKET, row.avatar_path), bannerUrl: imageUrl(PROFILE_BUCKET, row.banner_path) });
+  }
+
+  function toComment(row) {
+    return Object.assign(toEntry(row), { likes: likerIds(row.comment_likes) });
+  }
+
+  function toPost(row) {
+    return Object.assign(toEntry(row), {
+      imagePath: row.image_path,
+      imageUrl: imageUrl(POST_BUCKET, row.image_path),
+      likes: likerIds(row.post_likes),
+      comments: (row.comments || []).map(toComment)
+    });
+  }
+
+  function toThread(row) {
+    return Object.assign(toEntry(row), { category: row.category, title: row.title, replies: (row.replies || []).map(toEntry) });
+  }
+
   async function loadRemoteState() {
     const results = await Promise.all([
-      query(sb.from('profiles').select('id, name, handle, bio, color, avatar_path, banner_path')),
+      query(sb.from('profiles').select(COLUMNS.profile)),
       query(sb.from('posts')
-        .select('id, author_id, body, image_path, created_at, post_likes(user_id), comments(id, author_id, body, created_at, comment_likes(user_id))')
+        .select(COLUMNS.post + ', post_likes(user_id), comments(' + COLUMNS.comment + ', comment_likes(user_id))')
         .order('created_at', { ascending: false })
         .order('created_at', { referencedTable: 'comments', ascending: true })
         .limit(200)),
       query(sb.from('threads')
-        .select('id, author_id, category, title, body, created_at, replies(id, author_id, body, created_at)')
-        .order('created_at', { referencedTable: 'replies', ascending: true }))
+        .select(COLUMNS.thread + ', replies(' + COLUMNS.comment + ')')
+        .order('created_at', { ascending: false })
+        .order('created_at', { referencedTable: 'replies', ascending: true })
+        .limit(200))
     ]);
-    const profiles = results[0], posts = results[1], threads = results[2];
 
     state = {
-      users: Object.fromEntries(profiles.map(function (p) {
-        return [p.id, Object.assign(p, { avatarUrl: imageUrl(PROFILE_BUCKET, p.avatar_path), bannerUrl: imageUrl(PROFILE_BUCKET, p.banner_path) })];
-      })),
-      posts: posts.map(function (p) {
-        return Object.assign(toEntry(p), {
-          imagePath: p.image_path,
-          imageUrl: imageUrl(POST_BUCKET, p.image_path),
-          likes: p.post_likes.map(function (l) { return l.user_id; }),
-          comments: p.comments.map(function (c) {
-            return Object.assign(toEntry(c), { likes: c.comment_likes.map(function (l) { return l.user_id; }) });
-          })
-        });
-      }),
-      threads: threads.map(function (t) {
-        return { id: t.id, authorId: t.author_id, category: t.category, title: t.title, body: t.body, createdAt: Date.parse(t.created_at), replies: t.replies.map(toEntry) };
-      })
+      users: Object.fromEntries(results[0].map(function (p) { return [p.id, toUser(p)]; })),
+      posts: results[1].map(toPost), // newest first; kept that way as posts are added
+      threads: results[2].map(toThread)
     };
+    lastLoadedAt = Date.now();
   }
 
   function imageUrl(bucket, path) {
@@ -177,53 +206,71 @@
     });
   }
 
+  // Fetches everything fresh. Overlapping calls share one request.
   function reload() {
-    return loadRemoteState()
-      .catch(function (err) { ui.error = describeError(err); })
-      .finally(function () { loading = false; render(); });
+    if (!reloading) {
+      reloading = loadRemoteState()
+        .catch(function (err) { ui.error = describeError(err); })
+        .finally(function () { reloading = null; loading = false; render(); });
+    }
+    return reloading;
   }
 
+  async function uploadImage(bucket, path, blob) {
+    await query(sb.storage.from(bucket).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+  }
+
+  // Deletes files without waiting; a leftover file is harmless, so failures are ignored
+  function removeFiles(bucket, paths) {
+    if (paths.length) sb.storage.from(bucket).remove(paths);
+  }
+
+  // Each operation writes to the database and then updates the local copy of state to match,
+  // so the page doesn't have to reload everything after every action.
   const api = {
     createPost: async function (text, imageFile) {
       let path = null;
       if (imageFile) {
-        const blob = await fitImage(imageFile, POST_IMAGE_MAX_SIDE);
         path = meId + '/' + Date.now() + '.jpg';
-        await query(sb.storage.from(POST_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+        await uploadImage(POST_BUCKET, path, await fitImage(imageFile, POST_IMAGE_MAX_SIDE));
       }
       try {
-        await query(sb.from('posts').insert({ body: text, image_path: path }));
+        const row = await query(sb.from('posts').insert({ body: text, image_path: path }).select(COLUMNS.post).single());
+        state.posts.unshift(toPost(row));
       } catch (err) {
-        if (path) sb.storage.from(POST_BUCKET).remove([path]); // don't leave an orphaned photo
+        if (path) removeFiles(POST_BUCKET, [path]); // don't leave an orphaned photo
         throw err;
       }
     },
-    toggleLike: function (post) {
-      return post.likes.includes(meId)
-        ? query(sb.from('post_likes').delete().match({ post_id: post.id, user_id: meId }))
-        : query(sb.from('post_likes').insert({ post_id: post.id }));
-    },
-    toggleCommentLike: function (comment) {
-      return comment.likes.includes(meId)
-        ? query(sb.from('comment_likes').delete().match({ comment_id: comment.id, user_id: meId }))
-        : query(sb.from('comment_likes').insert({ comment_id: comment.id }));
+    // table/column name the likes table and its foreign key, e.g. 'post_likes'/'post_id'
+    setLiked: function (table, column, id, liked) {
+      const match = {};
+      match[column] = id;
+      if (liked) return query(sb.from(table).insert(match));
+      match.user_id = meId;
+      return query(sb.from(table).delete().match(match));
     },
     deletePost: async function (post) {
       await query(sb.from('posts').delete().eq('id', post.id));
-      if (post.imagePath) sb.storage.from(POST_BUCKET).remove([post.imagePath]); // clean up without blocking
+      state.posts = state.posts.filter(function (p) { return p !== post; });
+      if (post.imagePath) removeFiles(POST_BUCKET, [post.imagePath]);
     },
-    addComment: function (post, text) {
-      return query(sb.from('comments').insert({ post_id: post.id, body: text }));
+    addComment: async function (post, text) {
+      const row = await query(sb.from('comments').insert({ post_id: post.id, body: text }).select(COLUMNS.comment).single());
+      post.comments.push(toComment(row));
     },
     createThread: async function (fields) {
-      const row = await query(sb.from('threads').insert(fields).select('id').single());
+      const row = await query(sb.from('threads').insert(fields).select(COLUMNS.thread).single());
+      state.threads.unshift(toThread(row));
       return row.id;
     },
-    addReply: function (thread, text) {
-      return query(sb.from('replies').insert({ thread_id: thread.id, body: text }));
+    addReply: async function (thread, text) {
+      const row = await query(sb.from('replies').insert({ thread_id: thread.id, body: text }).select(COLUMNS.comment).single());
+      thread.replies.push(toEntry(row));
     },
-    deleteThread: function (id) {
-      return query(sb.from('threads').delete().eq('id', id));
+    deleteThread: async function (thread) {
+      await query(sb.from('threads').delete().eq('id', thread.id));
+      state.threads = state.threads.filter(function (t) { return t !== thread; });
     },
     // images: { avatar, banner }, each a File to upload, 'remove', or undefined to keep
     saveProfile: async function (fields, images) {
@@ -239,29 +286,27 @@
           if (image === 'remove') {
             fields[column] = null;
           } else {
-            const blob = await cropImage(image, IMAGE_SIZES[kind][0], IMAGE_SIZES[kind][1]);
             const path = meId + '/' + kind + '-' + Date.now() + '.jpg';
-            await query(sb.storage.from(PROFILE_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+            await uploadImage(PROFILE_BUCKET, path, await cropImage(image, IMAGE_SIZES[kind][0], IMAGE_SIZES[kind][1]));
             uploaded.push(path);
             fields[column] = path;
           }
         }
-        await query(sb.from('profiles').update(fields).eq('id', meId));
+        const row = await query(sb.from('profiles').update(fields).eq('id', meId).select(COLUMNS.profile).single());
+        state.users[meId] = toUser(row);
       } catch (err) {
-        if (uploaded.length) sb.storage.from(PROFILE_BUCKET).remove(uploaded); // don't leave orphaned files
+        removeFiles(PROFILE_BUCKET, uploaded); // don't leave orphaned files
         throw err;
       }
-      // Old files are no longer referenced; clean up without blocking the save
-      if (replaced.length) sb.storage.from(PROFILE_BUCKET).remove(replaced);
+      removeFiles(PROFILE_BUCKET, replaced); // old files are no longer referenced
     }
   };
 
-  // Runs a data operation, refreshes from the database, and re-renders. Resolves true on success.
+  // Runs a data operation and re-renders. Resolves true on success.
   async function run(task) {
     ui.error = '';
     try {
       await task();
-      await loadRemoteState();
       return true;
     } catch (err) {
       ui.error = describeError(err);
@@ -271,8 +316,29 @@
     }
   }
 
+  // Likes show up straight away; if saving fails they're put back and the error shown.
+  // Clicks on an item are ignored while its previous like is still saving.
+  async function toggleLike(item, table, column) {
+    if (!requireSignIn() || pendingLikes.has(item.id)) return;
+    const before = item.likes;
+    const liked = !before.includes(meId);
+    item.likes = liked ? before.concat(meId) : before.filter(function (id) { return id !== meId; });
+    ui.error = '';
+    pendingLikes.add(item.id);
+    render();
+    try {
+      await api.setLiked(table, column, item.id, liked);
+    } catch (err) {
+      item.likes = before;
+      ui.error = describeError(err);
+      render();
+    } finally {
+      pendingLikes.delete(item.id);
+    }
+  }
+
   function describeError(err) {
-    if (err && err.code === '23505') return 'That handle is already taken.';
+    if (err && err.code === '23505' && /handle/.test(err.message)) return 'That handle is already taken.';
     return (err && err.message) || 'Something went wrong. Please try again.';
   }
 
@@ -289,6 +355,15 @@
 
   function getUser(id) {
     return state.users[id] || { id: id, name: 'Unknown', handle: 'unknown', bio: '', color: AVATAR_COLORS[5] };
+  }
+
+  function findById(list, id) {
+    return list.find(function (item) { return item.id === id; });
+  }
+
+  // Only known colors go into style attributes
+  function safeColor(color, fallback) {
+    return AVATAR_COLORS.includes(color) ? color : fallback;
   }
 
   function timeAgo(ts) {
@@ -311,7 +386,7 @@
     if (user.avatarUrl) {
       return '<img class="avatar avatar-' + (size || 'md') + '" src="' + esc(user.avatarUrl) + '" alt="" loading="lazy">';
     }
-    const color = AVATAR_COLORS.includes(user.color) ? user.color : AVATAR_COLORS[5];
+    const color = safeColor(user.color, AVATAR_COLORS[5]);
     return '<span class="avatar avatar-' + (size || 'md') + '" style="--avatar:' + color + '" aria-hidden="true">' + esc(initials(user.name)) + '</span>';
   }
 
@@ -365,7 +440,7 @@
   }
 
   function renderPosts() {
-    const posts = state.posts.slice().sort(function (a, b) { return b.createdAt - a.createdAt; });
+    const posts = state.posts; // already newest first
     const composer = meId
       ? '<form class="card composer" data-submit="create-post">' +
           avatar(getUser(meId)) +
@@ -486,7 +561,7 @@
   }
 
   function renderThread(route) {
-    const thread = state.threads.find(function (t) { return t.id === route.id; });
+    const thread = findById(state.threads, route.id);
     const back = '<a class="back-link" href="#/forum">' + ICONS.back + '<span>Back to forum</span></a>';
     if (!thread) return back + emptyState('That thread could not be found. It may have been deleted.');
 
@@ -500,7 +575,7 @@
         '<header class="post-head">' + avatarLink(author) + byline(author, thread.createdAt) +
           (meId && thread.authorId === meId ? '<button class="icon-btn" data-action="delete-thread" aria-label="Delete thread">' + ICONS.trash + '</button>' : '') +
         '</header>' +
-        '<p class="post-body">' + esc(thread.body) + '</p>' +
+        '<p class="post-body">' + esc(thread.text) + '</p>' +
       '</article>' +
       '<h2 class="section-title">' + plural(thread.replies.length, 'reply', 'replies') + '</h2>' +
       '<div class="stack">' +
@@ -531,10 +606,11 @@
 
   // Profile header, stats and the member's posts/threads. isMe adds editing and sign-out.
   function profilePage(user, isMe) {
-    const posts = state.posts.filter(function (p) { return p.authorId === user.id; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
-    const threads = state.threads.filter(function (t) { return t.authorId === user.id; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
+    function byUser(item) { return item.authorId === user.id; }
+    const posts = state.posts.filter(byUser); // both lists are already newest first
+    const threads = state.threads.filter(byUser);
     const likes = posts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
-    const color = AVATAR_COLORS.includes(user.color) ? user.color : AVATAR_COLORS[0];
+    const color = safeColor(user.color, AVATAR_COLORS[0]);
     const editing = isMe && ui.editingProfile;
 
     let list;
@@ -662,9 +738,10 @@
     return { name: 'posts', tab: 'posts' };
   }
 
+  const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile, member: renderMember };
+
   function render() {
     const route = parseRoute();
-    const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile, member: renderMember };
     const error = ui.error ? '<p class="notice notice-error" role="alert">' + esc(ui.error) + '</p>' : '';
     let body;
     if (!sb) {
@@ -699,8 +776,7 @@
   // ---------- Actions ----------
 
   function findPost(el) {
-    const id = el.closest('[data-post]').dataset.post;
-    return state.posts.find(function (p) { return p.id === id; });
+    return findById(state.posts, el.closest('[data-post]').dataset.post);
   }
 
   function lockForm(form) {
@@ -715,16 +791,10 @@
       syncThemeControls();
     },
     like: function (el) {
-      if (!requireSignIn()) return;
-      const post = findPost(el);
-      el.disabled = true;
-      run(function () { return api.toggleLike(post); });
+      toggleLike(findPost(el), 'post_likes', 'post_id');
     },
     'like-comment': function (el) {
-      if (!requireSignIn()) return;
-      const comment = findPost(el).comments.find(function (c) { return c.id === el.dataset.comment; });
-      el.disabled = true;
-      run(function () { return api.toggleCommentLike(comment); });
+      toggleLike(findById(findPost(el).comments, el.dataset.comment), 'comment_likes', 'comment_id');
     },
     'toggle-comments': function (el) {
       const id = findPost(el).id;
@@ -756,8 +826,8 @@
     },
     'delete-thread': async function (el) {
       if (!confirm('Delete this thread and all its replies?')) return;
-      const id = el.closest('[data-thread]').dataset.thread;
-      if (await run(function () { return api.deleteThread(id); })) location.hash = '#/forum';
+      const thread = findById(state.threads, el.closest('[data-thread]').dataset.thread);
+      if (await run(function () { return api.deleteThread(thread); })) location.hash = '#/forum';
     },
     'edit-profile': function () {
       ui.editingProfile = true;
@@ -803,7 +873,7 @@
     },
     'add-comment': async function (form, data) {
       const text = data.get('text').trim();
-      const post = state.posts.find(function (p) { return p.id === form.dataset.post; });
+      const post = findById(state.posts, form.dataset.post);
       if (!text || !post) return;
       lockForm(form);
       if (await run(function () { return api.addComment(post, text); })) {
@@ -825,7 +895,7 @@
     },
     'add-reply': async function (form, data) {
       const text = data.get('text').trim();
-      const thread = state.threads.find(function (t) { return t.id === form.dataset.thread; });
+      const thread = findById(state.threads, form.dataset.thread);
       if (!text || !thread) return;
       lockForm(form);
       if (await run(function () { return api.addReply(thread, text); })) {
@@ -948,9 +1018,9 @@
       setTimeout(reload, 0);
     });
 
-    // Pick up new posts when someone comes back to the tab
+    // Pick up new posts when someone comes back to the tab, at most once a minute
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && !loading && !ui.editingProfile) reload();
+      if (!document.hidden && !loading && !ui.editingProfile && Date.now() - lastLoadedAt > RELOAD_AFTER_MS) reload();
     });
   }
 
