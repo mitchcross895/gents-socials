@@ -4,6 +4,9 @@
   const MAX_POST = 500;
   const CATEGORIES = ['General', 'Style', 'Fitness', 'Career', 'Off-topic'];
   const AVATAR_COLORS = ['#9a6b1f', '#2f6f8f', '#5b7f3a', '#8a4b8f', '#b4492f', '#3d4a5c'];
+  const IMAGE_BUCKET = 'profile-images';
+  const IMAGE_SIZES = { avatar: [400, 400], banner: [1500, 500] }; // uploads are cropped to these
+  const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // before resizing
   const TITLES = { posts: 'Posts', forum: 'Forum', profile: 'Profile' };
 
   const ICONS = {
@@ -73,7 +76,7 @@
 
   async function loadRemoteState() {
     const results = await Promise.all([
-      query(sb.from('profiles').select('id, name, handle, bio, color')),
+      query(sb.from('profiles').select('id, name, handle, bio, color, avatar_path, banner_path')),
       query(sb.from('posts')
         .select('id, author_id, body, created_at, post_likes(user_id), comments(id, author_id, body, created_at, comment_likes(user_id))')
         .order('created_at', { ascending: false })
@@ -86,7 +89,9 @@
     const profiles = results[0], posts = results[1], threads = results[2];
 
     state = {
-      users: Object.fromEntries(profiles.map(function (p) { return [p.id, p]; })),
+      users: Object.fromEntries(profiles.map(function (p) {
+        return [p.id, Object.assign(p, { avatarUrl: imageUrl(p.avatar_path), bannerUrl: imageUrl(p.banner_path) })];
+      })),
       posts: posts.map(function (p) {
         return Object.assign(toEntry(p), {
           likes: p.post_likes.map(function (l) { return l.user_id; }),
@@ -99,6 +104,40 @@
         return { id: t.id, authorId: t.author_id, category: t.category, title: t.title, body: t.body, createdAt: Date.parse(t.created_at), replies: t.replies.map(toEntry) };
       })
     };
+  }
+
+  function imageUrl(path) {
+    return path ? sb.storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl : '';
+  }
+
+  // Center-crops an image file to width×height and re-encodes it as JPEG.
+  // Keeps uploads small and drops hidden metadata such as photo GPS location.
+  async function resizeImage(file, width, height) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise(function (resolve, reject) {
+        const i = new Image();
+        i.onload = function () { resolve(i); };
+        i.onerror = function () { reject(new Error('That image couldn\'t be read. Try a JPG or PNG.')); };
+        i.src = url;
+      });
+      const scale = Math.max(width / img.naturalWidth, height / img.naturalHeight);
+      const sw = width / scale, sh = height / scale;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff'; // background for transparent PNGs
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, (img.naturalWidth - sw) / 2, (img.naturalHeight - sh) / 2, sw, sh, 0, 0, width, height);
+      return await new Promise(function (resolve, reject) {
+        canvas.toBlob(function (blob) {
+          if (blob) resolve(blob); else reject(new Error('That image couldn\'t be processed.'));
+        }, 'image/jpeg', 0.85);
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   }
 
   function reload() {
@@ -137,8 +176,34 @@
     deleteThread: function (id) {
       return query(sb.from('threads').delete().eq('id', id));
     },
-    saveProfile: function (fields) {
-      return query(sb.from('profiles').update(fields).eq('id', meId));
+    // images: { avatar, banner }, each a File to upload, 'remove', or undefined to keep
+    saveProfile: async function (fields, images) {
+      const me = getUser(meId);
+      const uploaded = [];
+      const replaced = [];
+      try {
+        for (const kind of ['avatar', 'banner']) {
+          const image = images[kind];
+          const column = kind + '_path';
+          if (!image) continue;
+          if (me[column]) replaced.push(me[column]);
+          if (image === 'remove') {
+            fields[column] = null;
+          } else {
+            const blob = await resizeImage(image, IMAGE_SIZES[kind][0], IMAGE_SIZES[kind][1]);
+            const path = meId + '/' + kind + '-' + Date.now() + '.jpg';
+            await query(sb.storage.from(IMAGE_BUCKET).upload(path, blob, { contentType: 'image/jpeg', cacheControl: '31536000' }));
+            uploaded.push(path);
+            fields[column] = path;
+          }
+        }
+        await query(sb.from('profiles').update(fields).eq('id', meId));
+      } catch (err) {
+        if (uploaded.length) sb.storage.from(IMAGE_BUCKET).remove(uploaded); // don't leave orphaned files
+        throw err;
+      }
+      // Old files are no longer referenced; clean up without blocking the save
+      if (replaced.length) sb.storage.from(IMAGE_BUCKET).remove(replaced);
     }
   };
 
@@ -194,6 +259,9 @@
   }
 
   function avatar(user, size) {
+    if (user.avatarUrl) {
+      return '<img class="avatar avatar-' + (size || 'md') + '" src="' + esc(user.avatarUrl) + '" alt="" loading="lazy">';
+    }
     const color = AVATAR_COLORS.includes(user.color) ? user.color : AVATAR_COLORS[5];
     return '<span class="avatar avatar-' + (size || 'md') + '" style="--avatar:' + color + '" aria-hidden="true">' + esc(initials(user.name)) + '</span>';
   }
@@ -394,7 +462,9 @@
 
     return viewHeader('Profile') +
       '<section class="card profile">' +
-        '<div class="profile-cover" style="--avatar:' + color + '"></div>' +
+        '<div class="profile-cover" style="--avatar:' + color + '">' +
+          (me.bannerUrl ? '<img src="' + esc(me.bannerUrl) + '" alt="">' : '') +
+        '</div>' +
         '<div class="profile-body">' +
           '<div class="profile-top">' + avatar(me, 'xl') +
             (ui.editingProfile ? '' : '<button class="btn" data-action="edit-profile">Edit profile</button>') +
@@ -422,6 +492,8 @@
       '<label class="field"><span>Name</span><input name="name" maxlength="40" required value="' + esc(me.name) + '"></label>' +
       '<label class="field"><span>Handle</span><input name="handle" maxlength="20" pattern="[A-Za-z0-9_]+" title="Letters, numbers and underscores only" required value="' + esc(me.handle) + '"></label>' +
       '<label class="field"><span>Bio</span><textarea name="bio" rows="3" maxlength="160">' + esc(me.bio || '') + '</textarea></label>' +
+      imageField('avatar', 'Profile picture', 'Square works best. Cropped to fit.', me.avatar_path) +
+      imageField('banner', 'Banner', 'Wide images work best (3:1). Cropped to fit.', me.banner_path) +
       '<fieldset class="field"><legend>Color</legend><div class="swatches">' +
         AVATAR_COLORS.map(function (c) {
           return '<label class="swatch" style="--avatar:' + c + '"><input type="radio" name="color" value="' + c + '"' + (c === me.color ? ' checked' : '') + '><span class="sr-only">' + c + '</span></label>';
@@ -429,6 +501,15 @@
       '</div></fieldset>' +
       '<div class="form-actions"><button class="btn" type="button" data-action="cancel-edit">Cancel</button><button class="btn btn-primary" type="submit">Save</button></div>' +
     '</form>';
+  }
+
+  function imageField(kind, label, hint, currentPath) {
+    return '<div class="field">' +
+      '<label class="field-label" for="image-' + kind + '">' + label + '</label>' +
+      '<input id="image-' + kind + '" class="file-input" type="file" name="' + kind + '" accept="image/jpeg,image/png,image/webp">' +
+      '<span class="muted small">' + hint + '</span>' +
+      (currentPath ? '<label class="check"><input type="checkbox" name="remove_' + kind + '"> Remove current ' + label.toLowerCase() + '</label>' : '') +
+    '</div>';
   }
 
   function renderAuth() {
@@ -654,8 +735,31 @@
         bio: data.get('bio').trim()
       };
       if (AVATAR_COLORS.includes(data.get('color'))) fields.color = data.get('color');
+
+      const images = {};
+      for (const kind of ['avatar', 'banner']) {
+        const file = data.get(kind);
+        if (file && file.size) {
+          if (!/^image\/(jpeg|png|webp)$/.test(file.type)) {
+            ui.error = 'Please choose a JPG, PNG or WebP image.';
+            render();
+            return;
+          }
+          if (file.size > MAX_UPLOAD_BYTES) {
+            ui.error = 'That image is over 10 MB. Please choose a smaller one.';
+            render();
+            return;
+          }
+          images[kind] = file;
+        } else if (data.get('remove_' + kind)) {
+          images[kind] = 'remove';
+        }
+      }
+
+      lockForm(form);
+      form.querySelector('[type="submit"]').textContent = 'Saving…';
       ui.editingProfile = false;
-      if (!(await run(function () { return api.saveProfile(fields); }))) {
+      if (!(await run(function () { return api.saveProfile(fields, images); }))) {
         ui.editingProfile = true; // keep the form open so the error can be fixed
         render();
       }
