@@ -264,6 +264,8 @@ a.byline-name:hover { text-decoration: underline; }
 }
 .action .icon { width: 19px; height: 19px; }
 .action:hover { background: var(--surface-2); color: var(--text); }
+.action-sm { min-height: 28px; padding: 0 8px; margin-top: 2px; font-size: 0.8rem; gap: 4px; }
+.action-sm .icon { width: 15px; height: 15px; }
 .action.liked { color: var(--like); }
 .action.liked .icon { fill: currentColor; }
 
@@ -273,8 +275,9 @@ a.byline-name:hover { text-decoration: underline; }
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
 }
 .comment { display: flex; gap: 10px; }
+.comment-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; }
 .comment-bubble {
-  flex: 1; min-width: 0;
+  align-self: stretch;
   padding: 8px 12px; border-radius: var(--radius-sm); background: var(--surface-2);
 }
 .comment-bubble .byline { flex-direction: row; flex-wrap: wrap; gap: 0 6px; align-items: baseline; }

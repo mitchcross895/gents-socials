@@ -75,7 +75,7 @@
     const results = await Promise.all([
       query(sb.from('profiles').select('id, name, handle, bio, color')),
       query(sb.from('posts')
-        .select('id, author_id, body, created_at, post_likes(user_id), comments(id, author_id, body, created_at)')
+        .select('id, author_id, body, created_at, post_likes(user_id), comments(id, author_id, body, created_at, comment_likes(user_id))')
         .order('created_at', { ascending: false })
         .order('created_at', { referencedTable: 'comments', ascending: true })
         .limit(200)),
@@ -90,7 +90,9 @@
       posts: posts.map(function (p) {
         return Object.assign(toEntry(p), {
           likes: p.post_likes.map(function (l) { return l.user_id; }),
-          comments: p.comments.map(toEntry)
+          comments: p.comments.map(function (c) {
+            return Object.assign(toEntry(c), { likes: c.comment_likes.map(function (l) { return l.user_id; }) });
+          })
         });
       }),
       threads: threads.map(function (t) {
@@ -113,6 +115,11 @@
       return post.likes.includes(meId)
         ? query(sb.from('post_likes').delete().match({ post_id: post.id, user_id: meId }))
         : query(sb.from('post_likes').insert({ post_id: post.id }));
+    },
+    toggleCommentLike: function (comment) {
+      return comment.likes.includes(meId)
+        ? query(sb.from('comment_likes').delete().match({ comment_id: comment.id, user_id: meId }))
+        : query(sb.from('comment_likes').insert({ comment_id: comment.id }));
     },
     deletePost: function (post) {
       return query(sb.from('posts').delete().eq('id', post.id));
@@ -272,7 +279,13 @@
     return '<section class="comments">' +
       post.comments.map(function (c) {
         const u = getUser(c.authorId);
-        return '<div class="comment">' + avatar(u, 'sm') + '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div></div>';
+        const liked = !!meId && c.likes.includes(meId);
+        return '<div class="comment">' + avatar(u, 'sm') +
+          '<div class="comment-main">' +
+            '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
+            '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
+          '</div>' +
+        '</div>';
       }).join('') +
       (meId
         ? '<form class="inline-form" data-submit="add-comment" data-post="' + esc(post.id) + '">' +
@@ -531,6 +544,12 @@
       const post = findPost(el);
       el.disabled = true;
       run(function () { return api.toggleLike(post); });
+    },
+    'like-comment': function (el) {
+      if (!requireSignIn()) return;
+      const comment = findPost(el).comments.find(function (c) { return c.id === el.dataset.comment; });
+      el.disabled = true;
+      run(function () { return api.toggleCommentLike(comment); });
     },
     'toggle-comments': function (el) {
       const id = findPost(el).id;
