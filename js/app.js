@@ -315,6 +315,12 @@
     return '<span class="avatar avatar-' + (size || 'md') + '" style="--avatar:' + color + '" aria-hidden="true">' + esc(initials(user.name)) + '</span>';
   }
 
+  // Avatar that links to the member's profile. Skipped by keyboard and screen readers,
+  // since the name beside it is the same link.
+  function avatarLink(user, size) {
+    return '<a class="avatar-link" href="' + esc(profileHref(user.id)) + '" tabindex="-1" aria-hidden="true">' + avatar(user, size) + '</a>';
+  }
+
   // Your own profile lives at #/profile; everyone else's at #/user/<id>
   function profileHref(id) {
     return meId && id === meId ? '#/profile' : '#/user/' + encodeURIComponent(id);
@@ -394,7 +400,7 @@
     const open = ui.openComments.has(post.id);
 
     return '<article class="card post" data-post="' + esc(post.id) + '">' +
-      '<header class="post-head">' + avatar(author) + byline(author, post.createdAt) +
+      '<header class="post-head">' + avatarLink(author) + byline(author, post.createdAt) +
         (meId && post.authorId === meId ? '<button class="icon-btn" data-action="delete-post" aria-label="Delete post">' + ICONS.trash + '</button>' : '') +
       '</header>' +
       (post.text ? '<p class="post-body">' + esc(post.text) + '</p>' : '') +
@@ -416,7 +422,7 @@
       post.comments.map(function (c) {
         const u = getUser(c.authorId);
         const liked = !!meId && c.likes.includes(meId);
-        return '<div class="comment">' + avatar(u, 'sm') +
+        return '<div class="comment">' + avatarLink(u, 'sm') +
           '<div class="comment-main">' +
             '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
             '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
@@ -467,15 +473,16 @@
 
   function threadRow(thread) {
     const author = getUser(thread.authorId);
-    return '<a class="thread-row" href="#/forum/' + encodeURIComponent(thread.id) + '">' +
-      avatar(author) +
+    // The title link stretches over the whole row; the author links sit above it
+    return '<div class="thread-row">' +
+      avatarLink(author) +
       '<div class="thread-row-main">' +
         '<span class="badge">' + esc(thread.category) + '</span>' +
-        '<h3>' + esc(thread.title) + '</h3>' +
-        '<span class="muted small">' + esc(author.name) + ' · active ' + timeAgo(lastActivity(thread)) + '</span>' +
+        '<h3><a class="thread-link" href="#/forum/' + encodeURIComponent(thread.id) + '">' + esc(thread.title) + '</a></h3>' +
+        '<span class="muted small"><a class="thread-author" href="' + esc(profileHref(author.id)) + '">' + esc(author.name) + '</a> · active ' + timeAgo(lastActivity(thread)) + '</span>' +
       '</div>' +
       '<div class="thread-row-count"><strong>' + thread.replies.length + '</strong><span class="muted small">' + (thread.replies.length === 1 ? 'reply' : 'replies') + '</span></div>' +
-    '</a>';
+    '</div>';
   }
 
   function renderThread(route) {
@@ -490,7 +497,7 @@
       '<article class="card thread" data-thread="' + esc(thread.id) + '">' +
         '<span class="badge">' + esc(thread.category) + '</span>' +
         '<h1 class="thread-title">' + esc(thread.title) + '</h1>' +
-        '<header class="post-head">' + avatar(author) + byline(author, thread.createdAt) +
+        '<header class="post-head">' + avatarLink(author) + byline(author, thread.createdAt) +
           (meId && thread.authorId === meId ? '<button class="icon-btn" data-action="delete-thread" aria-label="Delete thread">' + ICONS.trash + '</button>' : '') +
         '</header>' +
         '<p class="post-body">' + esc(thread.body) + '</p>' +
@@ -499,7 +506,7 @@
       '<div class="stack">' +
         thread.replies.map(function (r) {
           const u = getUser(r.authorId);
-          return '<div class="card reply"><header class="post-head">' + avatar(u, 'sm') + byline(u, r.createdAt) + '</header><p class="post-body">' + esc(r.text) + '</p></div>';
+          return '<div class="card reply"><header class="post-head">' + avatarLink(u, 'sm') + byline(u, r.createdAt) + '</header><p class="post-body">' + esc(r.text) + '</p></div>';
         }).join('') +
       '</div>' +
       (meId

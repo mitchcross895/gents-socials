@@ -221,6 +221,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .avatar-md { width: 44px; height: 44px; font-size: 0.95rem; }
 .avatar-xl { width: 96px; height: 96px; font-size: 2rem; border: 4px solid var(--surface); }
 img.avatar { object-fit: cover; background: var(--surface-2); }
+.avatar-link { display: inline-flex; flex: none; border-radius: 50%; text-decoration: none; transition: opacity 0.15s; }
+.avatar-link:hover { opacity: 0.85; }
 
 .badge {
   display: inline-block;
@@ -368,6 +370,16 @@ a.byline-name:hover { text-decoration: underline; }
 .thread-row:hover { background: var(--surface-2); }
 .thread-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .thread-row h3 { font-size: 1rem; line-height: 1.35; overflow-wrap: anywhere; }
+.thread-row { position: relative; }
+/* Title link covers the whole row so clicking anywhere opens the thread */
+.thread-link { color: inherit; text-decoration: none; }
+.thread-link::after { content: ''; position: absolute; inset: 0; }
+.thread-link:focus-visible { outline: none; }
+.thread-link:focus-visible::after { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Author links sit above the row link */
+.thread-row .avatar-link, .thread-author { position: relative; z-index: 1; }
+.thread-author { color: inherit; font-weight: 600; text-decoration: none; }
+.thread-author:hover { color: var(--text); text-decoration: underline; }
 .thread-row-count { display: flex; flex-direction: column; align-items: center; min-width: 48px; line-height: 1.2; }
 .thread-row-count strong { font-size: 1.1rem; }
 
