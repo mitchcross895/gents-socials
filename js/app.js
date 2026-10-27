@@ -315,10 +315,13 @@
     return '<span class="avatar avatar-' + (size || 'md') + '" style="--avatar:' + color + '" aria-hidden="true">' + esc(initials(user.name)) + '</span>';
   }
 
+  // Your own profile lives at #/profile; everyone else's at #/user/<id>
+  function profileHref(id) {
+    return meId && id === meId ? '#/profile' : '#/user/' + encodeURIComponent(id);
+  }
+
   function byline(user, ts) {
-    const name = meId && user.id === meId
-      ? '<a class="byline-name" href="#/profile">' + esc(user.name) + '</a>'
-      : '<span class="byline-name">' + esc(user.name) + '</span>';
+    const name = '<a class="byline-name" href="' + esc(profileHref(user.id)) + '">' + esc(user.name) + '</a>';
     return '<div class="byline">' + name +
       '<span class="muted">@' + esc(user.handle) + ' · ' + timeAgo(ts) + '</span></div>';
   }
@@ -509,45 +512,60 @@
 
   function renderProfile() {
     if (!meId) return renderAuth();
+    return profilePage(getUser(meId), true);
+  }
 
-    const me = getUser(meId);
-    const myPosts = state.posts.filter(function (p) { return p.authorId === meId; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
-    const myThreads = state.threads.filter(function (t) { return t.authorId === meId; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
-    const likes = myPosts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
-    const color = AVATAR_COLORS.includes(me.color) ? me.color : AVATAR_COLORS[0];
+  function renderMember(route) {
+    if (meId && route.id === meId) return renderProfile();
+    const user = state.users[route.id];
+    if (!user) return viewHeader('Member') + emptyState('This member couldn\'t be found.');
+    return profilePage(user, false);
+  }
+
+  // Profile header, stats and the member's posts/threads. isMe adds editing and sign-out.
+  function profilePage(user, isMe) {
+    const posts = state.posts.filter(function (p) { return p.authorId === user.id; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
+    const threads = state.threads.filter(function (t) { return t.authorId === user.id; }).sort(function (a, b) { return b.createdAt - a.createdAt; });
+    const likes = posts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
+    const color = AVATAR_COLORS.includes(user.color) ? user.color : AVATAR_COLORS[0];
+    const editing = isMe && ui.editingProfile;
 
     let list;
     if (ui.profileTab === 'posts') {
-      list = myPosts.length ? '<div class="stack">' + myPosts.map(postCard).join('') + '</div>' : emptyState('You haven\'t posted yet. Head to <a href="#/posts">Posts</a> to share something.');
+      list = posts.length
+        ? '<div class="stack">' + posts.map(postCard).join('') + '</div>'
+        : emptyState(isMe ? 'You haven\'t posted yet. Head to <a href="#/posts">Posts</a> to share something.' : esc(user.name) + ' hasn\'t posted yet.');
     } else {
-      list = myThreads.length ? '<div class="card thread-list">' + myThreads.map(threadRow).join('') + '</div>' : emptyState('You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.');
+      list = threads.length
+        ? '<div class="card thread-list">' + threads.map(threadRow).join('') + '</div>'
+        : emptyState(isMe ? 'You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.' : esc(user.name) + ' hasn\'t started any threads yet.');
     }
 
-    const footer = '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>';
+    const footer = isMe ? '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>' : '';
 
-    return viewHeader('Profile') +
+    return viewHeader(isMe ? 'Profile' : 'Member') +
       '<section class="card profile">' +
         '<div class="profile-cover" style="--avatar:' + color + '">' +
-          (me.bannerUrl ? '<img src="' + esc(me.bannerUrl) + '" alt="">' : '') +
+          (user.bannerUrl ? '<img src="' + esc(user.bannerUrl) + '" alt="">' : '') +
         '</div>' +
         '<div class="profile-body">' +
-          '<div class="profile-top">' + avatar(me, 'xl') +
-            (ui.editingProfile ? '' : '<button class="btn" data-action="edit-profile">Edit profile</button>') +
+          '<div class="profile-top">' + avatar(user, 'xl') +
+            (isMe && !editing ? '<button class="btn" data-action="edit-profile">Edit profile</button>' : '') +
           '</div>' +
-          (ui.editingProfile ? profileForm(me) :
-            '<h2 class="profile-name">' + esc(me.name) + '</h2>' +
-            '<p class="muted">@' + esc(me.handle) + '</p>' +
-            (me.bio ? '<p class="profile-bio">' + esc(me.bio) + '</p>' : '')) +
+          (editing ? profileForm(user) :
+            '<h2 class="profile-name">' + esc(user.name) + '</h2>' +
+            '<p class="muted">@' + esc(user.handle) + '</p>' +
+            (user.bio ? '<p class="profile-bio">' + esc(user.bio) + '</p>' : '')) +
           '<dl class="stats">' +
-            '<div><dt>Posts</dt><dd>' + myPosts.length + '</dd></div>' +
-            '<div><dt>Threads</dt><dd>' + myThreads.length + '</dd></div>' +
+            '<div><dt>Posts</dt><dd>' + posts.length + '</dd></div>' +
+            '<div><dt>Threads</dt><dd>' + threads.length + '</dd></div>' +
             '<div><dt>Likes</dt><dd>' + likes + '</dd></div>' +
           '</dl>' +
         '</div>' +
       '</section>' +
       '<div class="tabs" role="tablist">' +
-        '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="posts" aria-selected="' + (ui.profileTab === 'posts') + '">My posts</button>' +
-        '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="threads" aria-selected="' + (ui.profileTab === 'threads') + '">My threads</button>' +
+        '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="posts" aria-selected="' + (ui.profileTab === 'posts') + '">' + (isMe ? 'My posts' : 'Posts') + '</button>' +
+        '<button class="tab" role="tab" data-action="profile-tab" data-tab-name="threads" aria-selected="' + (ui.profileTab === 'threads') + '">' + (isMe ? 'My threads' : 'Threads') + '</button>' +
       '</div>' +
       list + footer;
   }
@@ -610,7 +628,7 @@
       '<section class="card aside-card"><h2>Members</h2>' +
         (members.length
           ? '<ul class="member-list">' + members.map(function (u) {
-              return '<li>' + avatar(u, 'sm') + '<div><strong>' + esc(u.name) + '</strong><span class="muted small">@' + esc(u.handle) + '</span></div></li>';
+              return '<li><a class="member-link" href="' + esc(profileHref(u.id)) + '">' + avatar(u, 'sm') + '<div><strong>' + esc(u.name) + '</strong><span class="muted small">@' + esc(u.handle) + '</span></div></a></li>';
             }).join('') + '</ul>'
           : '<p class="muted small">No other members yet.</p>') +
       '</section>';
@@ -632,13 +650,14 @@
     const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     const name = parts[0] || 'posts';
     if (name === 'forum' && parts[1]) return { name: 'thread', tab: 'forum', id: decodeURIComponent(parts[1]) };
+    if (name === 'user' && parts[1]) return { name: 'member', tab: null, id: decodeURIComponent(parts[1]) };
     if (TITLES[name]) return { name: name, tab: name };
     return { name: 'posts', tab: 'posts' };
   }
 
   function render() {
     const route = parseRoute();
-    const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile };
+    const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile, member: renderMember };
     const error = ui.error ? '<p class="notice notice-error" role="alert">' + esc(ui.error) + '</p>' : '';
     let body;
     if (!sb) {
@@ -664,8 +683,10 @@
       if (link.dataset.tab === route.tab) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     });
-    titleEl.textContent = TITLES[route.tab];
-    document.title = TITLES[route.tab] + ' · gentcore';
+    let title = TITLES[route.tab];
+    if (route.name === 'member') title = state.users[route.id] && route.id !== meId ? state.users[route.id].name : 'Profile';
+    titleEl.textContent = title;
+    document.title = title + ' · gentcore';
   }
 
   // ---------- Actions ----------

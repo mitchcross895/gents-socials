@@ -471,7 +471,12 @@ a.byline-name:hover { text-decoration: underline; }
 .aside-list a { display: block; color: var(--text); text-decoration: none; font-weight: 600; line-height: 1.35; }
 .aside-list a:hover { color: var(--accent); }
 .member-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
-.member-list li, .nav-me-link { display: flex; align-items: center; gap: 10px; }
+.member-link, .nav-me-link { display: flex; align-items: center; gap: 10px; }
+.member-link {
+  margin: -6px -8px; padding: 6px 8px; border-radius: var(--radius-sm);
+  color: var(--text); text-decoration: none;
+}
+.member-link:hover { background: var(--surface-2); }
 .member-list div, .nav-me-link div { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
 
 /* ---------- Tablet: icon sidebar ---------- */
