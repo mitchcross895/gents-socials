@@ -6,10 +6,12 @@
   const AVATAR_COLORS = ['#9a6b1f', '#2f6f8f', '#5b7f3a', '#8a4b8f', '#b4492f', '#3d4a5c'];
   const PROFILE_BUCKET = 'profile-images';
   const POST_BUCKET = 'post-images';
+  const BLOG_BUCKET = 'blog-images';
   const IMAGE_SIZES = { avatar: [400, 400], banner: [1500, 500] }; // profile uploads are cropped to these
   const POST_IMAGE_MAX_SIDE = 1600; // post photos are shrunk to fit, not cropped
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // before resizing
-  const TITLES = { posts: 'Posts', forum: 'Forum', profile: 'Profile' };
+  const TITLES = { posts: 'Posts', forum: 'Forum', wsl: 'Window Shopping Life', profile: 'Profile' };
+  const MAX_ARTICLE = 100000;
 
   const ICONS = {
     heart: '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
@@ -55,7 +57,11 @@
 
   // posts and threads are keyed by id so every list showing an item shares one copy.
   // lists holds the paged lists that have been loaded (see listSpec).
-  let state = { users: {}, posts: {}, threads: {}, lists: {}, stats: {}, popular: [], missingThreads: new Set() };
+  // blogAuthors: ids of the members who can write WSL articles
+  let state = {
+    users: {}, posts: {}, threads: {}, articles: {}, lists: {}, stats: {}, popular: [], blogAuthors: [],
+    missingThreads: new Set(), missingArticles: new Set()
+  };
   let meId = null; // signed-in user's id; null when signed out
   let loading = !!sb;
   let reloading = null;  // in-flight reload, shared so overlapping calls make one request
@@ -77,7 +83,10 @@
     error: '',
     drafts: {},
     postImage: null,       // File chosen for the post being written
-    postImagePreview: ''   // object URL for its preview
+    postImagePreview: '',  // object URL for its preview
+    articleEditorFor: null, // article id (or 'new') the WSL editor drafts belong to
+    articlePreview: false,
+    articleUploading: false
   };
 
   function setPostImage(file) {
@@ -98,7 +107,8 @@
     profile: 'id, name, handle, bio, color, avatar_path, banner_path',
     post: 'id, author_id, body, image_path, created_at',
     comment: 'id, author_id, body, created_at',
-    thread: 'id, author_id, category, title, body, created_at, reply_count, last_activity_at'
+    thread: 'id, author_id, category, title, body, created_at, reply_count, last_activity_at',
+    article: 'id, author_id, title, summary, cover_path, published, created_at, updated_at' // body only on the article page
   };
   const POST_SELECT = COLUMNS.post + ', post_likes(user_id), comments(' + COLUMNS.comment + ', comment_likes(user_id))';
   const THREAD_PAGE_SELECT = COLUMNS.thread + ', replies(' + COLUMNS.comment + ')';
@@ -141,6 +151,28 @@
     });
   }
 
+  // body is null until the article's own page loads it
+  function toArticle(row) {
+    return {
+      id: row.id,
+      authorId: row.author_id,
+      title: row.title,
+      summary: row.summary,
+      coverUrl: imageUrl(BLOG_BUCKET, row.cover_path),
+      published: row.published,
+      createdAt: Date.parse(row.created_at),
+      updatedAt: Date.parse(row.updated_at),
+      body: row.body === undefined ? null : row.body
+    };
+  }
+
+  function storeArticle(row) {
+    const article = toArticle(row);
+    const old = state.articles[row.id];
+    if (article.body === null && old && old.updatedAt === article.updatedAt) article.body = old.body;
+    return (state.articles[row.id] = article);
+  }
+
   function storePost(row) {
     return (state.posts[row.id] = toPost(row));
   }
@@ -154,13 +186,21 @@
   }
 
   // ---------- Paged lists ----------
-  // Keys: 'feed', 'forum/<category>', 'user-posts/<user id>', 'user-threads/<user id>'
+  // Keys: 'feed', 'wsl', 'forum/<category>', 'user-posts/<user id>', 'user-threads/<user id>'
+
+  // How each kind of row is fetched for a list and kept in state (state[table])
+  const TABLES = {
+    posts: { select: POST_SELECT, store: storePost },
+    threads: { select: COLUMNS.thread, store: storeThread },
+    articles: { select: COLUMNS.article, store: storeArticle }
+  };
 
   function listSpec(key) {
     const slash = key.indexOf('/');
     const kind = slash < 0 ? key : key.slice(0, slash);
     const arg = slash < 0 ? '' : key.slice(slash + 1);
     if (kind === 'feed') return { table: 'posts', order: 'created_at' };
+    if (kind === 'wsl') return { table: 'articles', order: 'created_at' };
     if (kind === 'forum') return { table: 'threads', order: 'last_activity_at', filter: arg === 'All' ? null : ['category', arg] };
     if (kind === 'user-posts') return { table: 'posts', order: 'created_at', filter: ['author_id', arg] };
     return { table: 'threads', order: 'created_at', filter: ['author_id', arg] };
@@ -169,16 +209,16 @@
   // Fetches up to `limit` items older than `cursor` (the sort column's value on the last item so far)
   async function fetchPage(key, limit, cursor) {
     const spec = listSpec(key);
-    const posts = spec.table === 'posts';
-    let request = sb.from(spec.table).select(posts ? POST_SELECT : COLUMNS.thread);
+    const table = TABLES[spec.table];
+    let request = sb.from(spec.table).select(table.select);
     if (spec.filter) request = request.eq(spec.filter[0], spec.filter[1]);
     if (cursor) request = request.lt(spec.order, cursor);
     request = request.order(spec.order, { ascending: false });
-    if (posts) request = request.order('created_at', { referencedTable: 'comments', ascending: true });
+    if (spec.table === 'posts') request = request.order('created_at', { referencedTable: 'comments', ascending: true });
     const rows = await query(request.limit(limit + 1)); // one extra shows whether there are more
     const page = rows.slice(0, limit);
     return {
-      ids: page.map(function (row) { return (posts ? storePost(row) : storeThread(row)).id; }),
+      ids: page.map(function (row) { return table.store(row).id; }),
       cursor: page.length ? page[page.length - 1][spec.order] : cursor,
       more: rows.length > limit
     };
@@ -193,8 +233,8 @@
 
   // Items in a list that still exist (deleted ones drop out)
   function listItems(key) {
-    const table = listSpec(key).table === 'posts' ? state.posts : state.threads;
-    return state.lists[key].ids.map(function (id) { return table[id]; }).filter(Boolean);
+    const items = state[listSpec(key).table];
+    return state.lists[key].ids.map(function (id) { return items[id]; }).filter(Boolean);
   }
 
   // Adds a new item to the top of a list, if that list has been loaded
@@ -206,6 +246,11 @@
     const row = await query(sb.from('threads').select(THREAD_PAGE_SELECT).eq('id', id)
       .order('created_at', { referencedTable: 'replies', ascending: true }).maybeSingle());
     if (row) storeThread(row); else state.missingThreads.add(id);
+  }
+
+  async function loadArticle(id) {
+    const row = await query(sb.from('articles').select(COLUMNS.article + ', body').eq('id', id).maybeSingle());
+    if (row) storeArticle(row); else state.missingArticles.add(id);
   }
 
   async function loadStats(id) {
@@ -227,6 +272,7 @@
   // The paged list the current page shows, if any
   function routeListKey(route) {
     if (route.name === 'posts') return 'feed';
+    if (route.name === 'wsl') return 'wsl';
     if (route.name === 'forum') return 'forum/' + ui.forumCategory;
     const userId = route.name === 'profile' ? meId : route.name === 'member' ? route.id : null;
     return userId ? (ui.profileTab === 'posts' ? 'user-posts/' : 'user-threads/') + userId : null;
@@ -250,8 +296,11 @@
         return fetchPage(key, Math.max(PAGE_SIZE, state.lists[key] ? state.lists[key].ids.length : 0));
       })),
       Promise.all(statIds.map(loadStats)),
-      route.name === 'thread' ? loadThread(route.id) : null
+      route.name === 'thread' ? loadThread(route.id) : null,
+      query(sb.from('blog_authors').select('user_id')),
+      (route.name === 'article' || route.name === 'wsl-edit') && route.id ? loadArticle(route.id) : null
     ]);
+    state.blogAuthors = results[5].map(function (row) { return row.user_id; });
 
     state.users = Object.fromEntries(results[0].map(function (p) { return [p.id, toUser(p)]; }));
     state.popular = results[1].map(function (row) { return storeThread(row).id; });
@@ -407,12 +456,34 @@
     deleteThread: async function (thread) {
       await query(sb.from('threads').delete().eq('id', thread.id));
       delete state.threads[thread.id];
+      state.missingThreads.add(thread.id);
       bumpStat(meId, 'threads', -1);
     },
     // True if a member already uses this handle (checked before sign-up)
     handleTaken: async function (handle) {
       const rows = await query(sb.from('profiles').select('id').eq('handle', handle).limit(1));
       return rows.length > 0;
+    },
+    // Creates (id null) or updates an article. Resolves to its id.
+    saveArticle: async function (id, fields) {
+      const request = id
+        ? sb.from('articles').update(fields).eq('id', id)
+        : sb.from('articles').insert(fields);
+      const row = await query(request.select(COLUMNS.article + ', body').single());
+      storeArticle(row);
+      if (!id) prepend('wsl', row.id);
+      return row.id;
+    },
+    deleteArticle: async function (article) {
+      await query(sb.from('articles').delete().eq('id', article.id));
+      delete state.articles[article.id];
+      state.missingArticles.add(article.id); // so the page doesn't try to fetch it again
+      removeFiles(BLOG_BUCKET, articleImagePaths(article.body || '').filter(function (p) { return p.indexOf(meId + '/') === 0; }));
+    },
+    uploadBlogImage: async function (file) {
+      const path = meId + '/' + Date.now() + '.jpg';
+      await uploadImage(BLOG_BUCKET, path, await fitImage(file, POST_IMAGE_MAX_SIDE));
+      return path;
     },
     // images: { avatar, banner }, each a File to upload, 'remove', or undefined to keep
     saveProfile: async function (fields, images) {
@@ -762,6 +833,148 @@
         : signInPrompt('Sign in to reply to this thread.'));
   }
 
+  // ---------- WSL (Window Shopping Life) blog ----------
+  // Articles are plain text. Blocks are separated by a blank line; a block starting with "## "
+  // is a heading, and a line like ![caption](<user id>/<file>.jpg) is a picture from the blog bucket.
+
+  const ARTICLE_IMAGE = /^!\[([^\]\n]*)\]\(([0-9a-f-]{36}\/[A-Za-z0-9_.-]{1,100})\)$/;
+
+  function articleBlocks(text) {
+    return text.split(/\n\s*\n/).map(function (b) { return b.trim(); }).filter(Boolean);
+  }
+
+  function articleImagePaths(text) {
+    return articleBlocks(text)
+      .map(function (b) { const m = b.match(ARTICLE_IMAGE); return m && m[2]; })
+      .filter(Boolean);
+  }
+
+  function articleBody(text) {
+    return articleBlocks(text).map(function (block) {
+      const img = block.match(ARTICLE_IMAGE);
+      if (img) {
+        return '<figure class="article-figure"><img src="' + esc(imageUrl(BLOG_BUCKET, img[2])) + '" alt="' + esc(img[1]) + '" loading="lazy">' +
+          (img[1] ? '<figcaption>' + esc(img[1]) + '</figcaption>' : '') + '</figure>';
+      }
+      if (block.indexOf('## ') === 0) return '<h2>' + esc(block.slice(3)) + '</h2>';
+      return '<p>' + esc(block) + '</p>';
+    }).join('');
+  }
+
+  function isBlogAuthor() {
+    return !!meId && state.blogAuthors.includes(meId);
+  }
+
+  function longDate(ts) {
+    return new Date(ts).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+  }
+
+  function renderWsl() {
+    const newBtn = isBlogAuthor() ? '<a class="btn btn-primary" href="#/wsl/new">' + ICONS.plus + '<span>New article</span></a>' : '';
+    return viewHeader(TITLES.wsl, newBtn) +
+      pagedList('wsl', {
+        item: articleCard,
+        wrap: function (html) { return '<div class="stack">' + html + '</div>'; },
+        empty: 'No articles yet. Check back soon.'
+      });
+  }
+
+  function articleCard(article) {
+    const author = getUser(article.authorId);
+    return '<a class="card article-card" href="#/wsl/' + encodeURIComponent(article.id) + '">' +
+      (article.coverUrl ? '<img class="article-card-cover" src="' + esc(article.coverUrl) + '" alt="" loading="lazy">' : '') +
+      '<div class="article-card-main">' +
+        (article.published ? '' : '<span class="badge">Draft</span>') +
+        '<h2>' + esc(article.title) + '</h2>' +
+        (article.summary ? '<p class="muted">' + esc(article.summary) + '</p>' : '') +
+        '<span class="muted small">By ' + esc(author.name) + ' · ' + longDate(article.createdAt) + '</span>' +
+      '</div>' +
+    '</a>';
+  }
+
+  function renderArticle(route) {
+    const back = '<a class="back-link" href="#/wsl">' + ICONS.back + '<span>Back to ' + esc(TITLES.wsl) + '</span></a>';
+    const article = state.articles[route.id];
+    if (state.missingArticles.has(route.id)) return back + emptyState('That article could not be found.');
+    if (!article || article.body === null) {
+      ensure('article:' + route.id, function () { return loadArticle(route.id); });
+      return back + emptyState('Loading…');
+    }
+    const author = getUser(article.authorId);
+    const mine = meId && article.authorId === meId;
+    return back +
+      '<article class="card article" data-article="' + esc(article.id) + '">' +
+        (article.published ? '' : '<span class="badge">Draft · only writers can see this</span>') +
+        '<h1 class="article-title">' + esc(article.title) + '</h1>' +
+        (article.summary ? '<p class="article-summary">' + esc(article.summary) + '</p>' : '') +
+        '<header class="post-head article-byline">' + avatarLink(author) +
+          '<div class="byline"><a class="byline-name" href="' + esc(profileHref(author.id)) + '">' + esc(author.name) + '</a>' +
+            '<span class="muted">' + longDate(article.createdAt) +
+              (article.updatedAt - article.createdAt > 3600e3 ? ' · updated ' + longDate(article.updatedAt) : '') + '</span></div>' +
+          (mine ? '<a class="btn btn-small" href="#/wsl/' + encodeURIComponent(article.id) + '/edit">Edit</a>' : '') +
+        '</header>' +
+        '<div class="article-body">' + articleBody(article.body) + '</div>' +
+      '</article>';
+  }
+
+  function renderArticleEditor(route) {
+    if (!isBlogAuthor()) return viewHeader(TITLES.wsl) + emptyState('Only WSL writers can write articles.');
+    const article = route.id ? state.articles[route.id] : null;
+    if (route.id) {
+      if (state.missingArticles.has(route.id)) return viewHeader(TITLES.wsl) + emptyState('That article could not be found.');
+      if (!article || article.body === null) {
+        ensure('article:' + route.id, function () { return loadArticle(route.id); });
+        return viewHeader(TITLES.wsl) + emptyState('Loading…');
+      }
+      if (article.authorId !== meId) return viewHeader(TITLES.wsl) + emptyState('You can only edit your own articles.');
+    }
+
+    // Start fresh drafts when switching to a different article
+    const editorKey = route.id || 'new';
+    if (ui.articleEditorFor !== editorKey) {
+      ui.articleEditorFor = editorKey;
+      ui.articlePreview = false;
+      ui.drafts['wsl-title'] = article ? article.title : '';
+      ui.drafts['wsl-summary'] = article ? article.summary : '';
+      ui.drafts['wsl-body'] = article ? article.body : '';
+      ui.drafts['wsl-published'] = article && article.published ? '1' : '';
+    }
+
+    const body = ui.drafts['wsl-body'] || '';
+    const cancelHref = route.id ? '#/wsl/' + encodeURIComponent(route.id) : '#/wsl';
+    return viewHeader(route.id ? 'Edit article' : 'New article') +
+      '<form class="card form article-editor" data-submit="save-article"' + (route.id ? ' data-article="' + esc(route.id) + '"' : '') + '>' +
+        '<label class="field"><span>Title</span><input name="title" maxlength="150" required data-draft="wsl-title" value="' + draft('wsl-title') + '"></label>' +
+        '<label class="field"><span>Summary <span class="muted small">(optional, shown on the article list)</span></span>' +
+          '<textarea name="summary" rows="2" maxlength="300" data-draft="wsl-summary">' + draft('wsl-summary') + '</textarea></label>' +
+        '<div class="field">' +
+          '<div class="editor-toolbar">' +
+            '<div class="tabs editor-tabs" role="tablist">' +
+              '<button type="button" class="tab" role="tab" data-action="article-preview" data-preview="" aria-selected="' + !ui.articlePreview + '">Write</button>' +
+              '<button type="button" class="tab" role="tab" data-action="article-preview" data-preview="1" aria-selected="' + ui.articlePreview + '">Preview</button>' +
+            '</div>' +
+            (ui.articlePreview ? '' :
+              '<label class="btn btn-small' + (ui.articleUploading ? ' is-busy' : '') + '">' + ICONS.image +
+                '<span>' + (ui.articleUploading ? 'Uploading…' : 'Add photo') + '</span>' +
+                '<input class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" data-image-input="article"' + (ui.articleUploading ? ' disabled' : '') + '>' +
+              '</label>') +
+          '</div>' +
+          (ui.articlePreview
+            ? '<div class="article-body article-preview">' + (body.trim() ? articleBody(body) : '<p class="muted">Nothing to preview yet.</p>') + '</div>'
+            : '<label class="sr-only" for="article-body">Article</label>' +
+              '<textarea id="article-body" class="article-textarea" name="body" rows="18" maxlength="' + MAX_ARTICLE + '" data-draft="wsl-body">' + draft('wsl-body') + '</textarea>' +
+              '<span class="muted small">Leave a blank line between paragraphs. Start a line with <code>## </code> for a heading. ' +
+                'Photos go in where your cursor is; type a caption between the [ ] brackets.</span>') +
+        '</div>' +
+        '<label class="check"><input type="checkbox" name="published" data-draft="wsl-published"' + (ui.drafts['wsl-published'] ? ' checked' : '') + '> Published (visible to everyone)</label>' +
+        '<div class="form-actions">' +
+          (route.id ? '<button class="btn btn-danger-text" type="button" data-action="delete-article">Delete</button>' : '') +
+          '<button class="btn" type="button" data-action="cancel-article" data-href="' + esc(cancelHref) + '">Cancel</button>' +
+          '<button class="btn btn-primary" type="submit">Save</button>' +
+        '</div>' +
+      '</form>';
+  }
+
   function renderProfile() {
     if (!meId) return renderAuth();
     return profilePage(getUser(meId), true);
@@ -907,11 +1120,17 @@
     const name = parts[0] || 'posts';
     if (name === 'forum' && parts[1]) return { name: 'thread', tab: 'forum', id: decodeURIComponent(parts[1]) };
     if (name === 'user' && parts[1]) return { name: 'member', tab: null, id: decodeURIComponent(parts[1]) };
+    if (name === 'wsl' && parts[1] === 'new') return { name: 'wsl-edit', tab: 'wsl', id: null };
+    if (name === 'wsl' && parts[1] && parts[2] === 'edit') return { name: 'wsl-edit', tab: 'wsl', id: decodeURIComponent(parts[1]) };
+    if (name === 'wsl' && parts[1]) return { name: 'article', tab: 'wsl', id: decodeURIComponent(parts[1]) };
     if (TITLES[name]) return { name: name, tab: name };
     return { name: 'posts', tab: 'posts' };
   }
 
-  const views = { posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile, member: renderMember };
+  const views = {
+    posts: renderPosts, forum: renderForum, thread: renderThread, profile: renderProfile, member: renderMember,
+    wsl: renderWsl, article: renderArticle, 'wsl-edit': renderArticleEditor
+  };
 
   function render() {
     const route = parseRoute();
@@ -942,7 +1161,8 @@
     });
     let title = TITLES[route.tab];
     if (route.name === 'member') title = state.users[route.id] && route.id !== meId ? state.users[route.id].name : 'Profile';
-    titleEl.textContent = title;
+    if (route.name === 'article' && state.articles[route.id]) title = state.articles[route.id].title;
+    titleEl.textContent = route.tab === 'wsl' ? 'WSL' : title; // short name fits the phone top bar
     document.title = title + ' · gentcore';
   }
 
@@ -1003,6 +1223,23 @@
       loadMore(key)
         .catch(function (err) { ui.error = describeError(err); })
         .finally(function () { pendingPages.delete(key); render(); });
+    },
+    'article-preview': function (el) {
+      ui.articlePreview = !!el.dataset.preview;
+      render();
+    },
+    'cancel-article': function (el) {
+      ui.articleEditorFor = null; // drop unsaved changes
+      ui.error = '';
+      location.hash = el.dataset.href;
+    },
+    'delete-article': async function () {
+      if (!confirm('Delete this article? This can\'t be undone.')) return;
+      const article = state.articles[parseRoute().id];
+      if (await run(function () { return api.deleteArticle(article); })) {
+        ui.articleEditorFor = null;
+        location.hash = '#/wsl';
+      }
     },
     'remove-post-image': function () {
       setPostImage(null);
@@ -1129,6 +1366,29 @@
         render();
       }
     },
+    // Reads the drafts rather than the form, since Preview hides the article text box
+    'save-article': async function (form) {
+      const id = form.dataset.article || null;
+      const body = ui.drafts['wsl-body'] || '';
+      const fields = {
+        title: (ui.drafts['wsl-title'] || '').trim(),
+        summary: (ui.drafts['wsl-summary'] || '').trim(),
+        body: body,
+        cover_path: articleImagePaths(body)[0] || null,
+        published: !!ui.drafts['wsl-published']
+      };
+      if (!fields.title) {
+        ui.error = 'Give the article a title.';
+        render();
+        return;
+      }
+      lockForm(form);
+      let savedId;
+      if (await run(async function () { savedId = await api.saveArticle(id, fields); })) {
+        ui.articleEditorFor = null;
+        location.hash = '#/wsl/' + encodeURIComponent(savedId);
+      }
+    },
     'sign-in': async function (form, data) {
       lockForm(form);
       const result = await sb.auth.signInWithPassword({ email: data.get('email'), password: data.get('password') });
@@ -1193,22 +1453,52 @@
   // Keep in-progress text so re-renders (e.g. liking a post) don't wipe it
   document.addEventListener('input', function (e) {
     const el = e.target;
-    if (el.dataset.draft) ui.drafts[el.dataset.draft] = el.value;
+    if (el.dataset.draft) ui.drafts[el.dataset.draft] = el.type === 'checkbox' ? (el.checked ? '1' : '') : el.value;
     if (el.dataset.counter) document.getElementById(el.dataset.counter).textContent = el.value.length + '/' + el.maxLength;
   });
 
-  // Photo picked in the post composer: check it and show a preview
   document.addEventListener('change', function (e) {
     const input = e.target;
-    if (input.dataset.imageInput !== 'post' || !input.files.length) return;
+    if (!input.dataset.imageInput || !input.files.length) return;
     const file = input.files[0];
     ui.error = checkImageFile(file);
-    if (!ui.error) setPostImage(file);
-    render();
+    if (ui.error) render();
+    else if (input.dataset.imageInput === 'post') { setPostImage(file); render(); } // composer: show a preview
+    else if (input.dataset.imageInput === 'article') insertArticleImage(file);
   });
+
+  // Uploads a photo and puts it into the article text where the cursor was,
+  // then leaves the cursor between the [ ] so a caption can be typed
+  async function insertArticleImage(file) {
+    const box = document.getElementById('article-body');
+    const at = box ? box.selectionStart : (ui.drafts['wsl-body'] || '').length;
+    ui.articleUploading = true;
+    render();
+    try {
+      const path = await api.uploadBlogImage(file);
+      const text = ui.drafts['wsl-body'] || '';
+      const before = text.slice(0, at).replace(/\s*$/, '');
+      const after = text.slice(at).replace(/^\s*/, '');
+      const snippet = (before ? '\n\n' : '') + '![](' + path + ')\n\n';
+      ui.drafts['wsl-body'] = before + snippet + after;
+      ui.articleUploading = false;
+      render();
+      const fresh = document.getElementById('article-body');
+      if (fresh) {
+        const caret = before.length + snippet.indexOf('[') + 1;
+        fresh.focus();
+        fresh.setSelectionRange(caret, caret);
+      }
+    } catch (err) {
+      ui.articleUploading = false;
+      ui.error = describeError(err);
+      render();
+    }
+  }
 
   window.addEventListener('hashchange', function () {
     ui.editingProfile = false;
+    ui.articlePreview = false;
     ui.error = '';
     render();
     window.scrollTo(0, 0);
