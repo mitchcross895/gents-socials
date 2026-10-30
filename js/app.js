@@ -60,7 +60,7 @@
   // blogAuthors: ids of the members who can write WSL articles
   let state = {
     users: {}, posts: {}, threads: {}, articles: {}, lists: {}, stats: {}, popular: [], blogAuthors: [],
-    missingThreads: new Set(), missingArticles: new Set()
+    missing: new Set() // 'thread:<id>' / 'article:<id>' keys for items the database doesn't have
   };
   let meId = null; // signed-in user's id; null when signed out
   let loading = !!sb;
@@ -255,7 +255,7 @@
   async function loadThread(id) {
     const row = await query(sb.from('threads').select(THREAD_PAGE_SELECT).eq('id', id)
       .order('created_at', { referencedTable: 'replies', ascending: true }).maybeSingle());
-    if (row) storeThread(row); else state.missingThreads.add(id);
+    if (row) storeThread(row); else state.missing.add('thread:' + id);
   }
 
   async function loadArticle(id) {
@@ -264,7 +264,7 @@
       .eq('id', id)
       .order('created_at', { referencedTable: 'discussion', ascending: true })
       .maybeSingle());
-    if (row) storeArticle(row); else state.missingArticles.add(id);
+    if (row) storeArticle(row); else state.missing.add('article:' + id);
   }
 
   async function loadStats(id) {
@@ -470,7 +470,7 @@
     deleteThread: async function (thread) {
       await query(sb.from('threads').delete().eq('id', thread.id));
       delete state.threads[thread.id];
-      state.missingThreads.add(thread.id);
+      state.missing.add('thread:' + thread.id);
       bumpStat(meId, 'threads', -1);
     },
     // True if a member already uses this handle (checked before sign-up)
@@ -492,7 +492,7 @@
     deleteArticle: async function (article) {
       await query(sb.from('articles').delete().eq('id', article.id));
       delete state.articles[article.id];
-      state.missingArticles.add(article.id); // so the page doesn't try to fetch it again
+      state.missing.add('article:' + article.id); // so the page doesn't try to fetch it again
       removeFiles(BLOG_BUCKET, articleImagePaths(article.body || '').filter(function (p) { return p.indexOf(meId + '/') === 0; }));
     },
     addArticleComment: async function (article, text) {
@@ -642,10 +642,26 @@
     return meId && id === meId ? '#/profile' : '#/user/' + encodeURIComponent(id);
   }
 
-  function byline(user, ts) {
+  // Name linking to the profile, then "@handle · 2h" (or detailHtml in its place)
+  function byline(user, ts, detailHtml) {
     const name = '<a class="byline-name" href="' + esc(profileHref(user.id)) + '">' + esc(user.name) + '</a>';
     return '<div class="byline">' + name +
-      '<span class="muted">@' + esc(user.handle) + ' · ' + timeAgo(ts) + '</span></div>';
+      '<span class="muted">' + (detailHtml || '@' + esc(user.handle) + ' · ' + timeAgo(ts)) + '</span></div>';
+  }
+
+  // A comment: avatar, bubble with byline and text, then any action buttons
+  function commentItem(comment, actionsHtml) {
+    const u = getUser(comment.authorId);
+    return '<div class="comment">' + avatarLink(u, 'sm') +
+      '<div class="comment-main">' +
+        '<div class="comment-bubble">' + byline(u, comment.createdAt) + '<p>' + esc(comment.text) + '</p></div>' +
+        (actionsHtml ? '<div class="comment-actions">' + actionsHtml + '</div>' : '') +
+      '</div>' +
+    '</div>';
+  }
+
+  function deleteCommentButton(action, comment) {
+    return '<button class="action action-sm action-delete" data-action="' + action + '" data-comment="' + esc(comment.id) + '" aria-label="Delete comment">' + ICONS.trash + '</button>';
   }
 
   function plural(n, one, many) {
@@ -752,17 +768,10 @@
     const key = 'comment-' + post.id;
     return '<section class="comments">' +
       post.comments.map(function (c) {
-        const u = getUser(c.authorId);
         const liked = !!meId && c.likes.includes(meId);
-        return '<div class="comment">' + avatarLink(u, 'sm') +
-          '<div class="comment-main">' +
-            '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
-            '<div class="comment-actions">' +
-              '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
-              (meId && c.authorId === meId ? '<button class="action action-sm action-delete" data-action="delete-comment" data-comment="' + esc(c.id) + '" aria-label="Delete comment">' + ICONS.trash + '</button>' : '') +
-            '</div>' +
-          '</div>' +
-        '</div>';
+        return commentItem(c,
+          '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
+          (meId && c.authorId === meId ? deleteCommentButton('delete-comment', c) : ''));
       }).join('') +
       (meId
         ? '<form class="inline-form" data-submit="add-comment" data-post="' + esc(post.id) + '">' +
@@ -823,7 +832,7 @@
   function renderThread(route) {
     const thread = state.threads[route.id];
     const back = '<a class="back-link" href="#/forum">' + ICONS.back + '<span>Back to forum</span></a>';
-    if (state.missingThreads.has(route.id)) return back + emptyState('That thread could not be found. It may have been deleted.');
+    if (state.missing.has('thread:' + route.id)) return back + emptyState('That thread could not be found. It may have been deleted.');
     if (!thread || !thread.replies) {
       ensure('thread:' + route.id, function () { return loadThread(route.id); });
       return back + emptyState('Loading…');
@@ -921,7 +930,7 @@
   function renderArticle(route) {
     const back = '<a class="back-link" href="#/wsl">' + ICONS.back + '<span>Back to ' + esc(TITLES.wsl) + '</span></a>';
     const article = state.articles[route.id];
-    if (state.missingArticles.has(route.id)) return back + emptyState('That article could not be found.');
+    if (state.missing.has('article:' + route.id)) return back + emptyState('That article could not be found.');
     if (!article || article.body === null || !article.comments) {
       ensure('article:' + route.id, function () { return loadArticle(route.id); });
       return back + emptyState('Loading…');
@@ -934,9 +943,8 @@
         '<h1 class="article-title">' + esc(article.title) + '</h1>' +
         (article.summary ? '<p class="article-summary">' + esc(article.summary) + '</p>' : '') +
         '<header class="post-head article-byline">' + avatarLink(author) +
-          '<div class="byline"><a class="byline-name" href="' + esc(profileHref(author.id)) + '">' + esc(author.name) + '</a>' +
-            '<span class="muted">' + longDate(article.createdAt) +
-              (article.updatedAt - article.createdAt > 3600e3 ? ' · updated ' + longDate(article.updatedAt) : '') + '</span></div>' +
+          byline(author, null, longDate(article.createdAt) +
+            (article.updatedAt - article.createdAt > 3600e3 ? ' · updated ' + longDate(article.updatedAt) : '')) +
           (mine ? '<a class="btn btn-small" href="#/wsl/' + encodeURIComponent(article.id) + '/edit">Edit</a>' : '') +
         '</header>' +
         '<div class="article-body">' + articleBody(article.body) + '</div>' +
@@ -953,8 +961,8 @@
     else if (!meId) form = '<p class="muted small"><a href="#/profile">Sign in</a> to join the discussion.</p>';
     else {
       form = '<form class="form discussion-form" data-submit="add-article-comment" data-article="' + esc(article.id) + '">' +
-        '<label class="sr-only" for="' + esc(key) + '">Add to the discussion</label>' +
-        '<textarea id="' + esc(key) + '" name="text" rows="3" maxlength="1000" required placeholder="What did you think?" data-draft="' + esc(key) + '">' + draft(key) + '</textarea>' +
+        '<label class="field"><span class="sr-only">Add to the discussion</span>' +
+          '<textarea name="text" rows="3" maxlength="1000" required placeholder="What did you think?" data-draft="' + esc(key) + '">' + draft(key) + '</textarea></label>' +
         '<div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Post comment</button></div>' +
       '</form>';
     }
@@ -962,14 +970,8 @@
       '<h2 class="section-title">Discussion' + (article.comments.length ? ' <span class="muted">(' + article.comments.length + ')</span>' : '') + '</h2>' +
       (article.comments.length || !article.published ? '' : '<p class="muted small">No comments yet. Start the conversation.</p>') +
       article.comments.map(function (c) {
-        const u = getUser(c.authorId);
         const canDelete = meId && (c.authorId === meId || canModerate);
-        return '<div class="comment">' + avatarLink(u, 'sm') +
-          '<div class="comment-main">' +
-            '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
-            (canDelete ? '<div class="comment-actions"><button class="action action-sm action-delete" data-action="delete-article-comment" data-comment="' + esc(c.id) + '" aria-label="Delete comment">' + ICONS.trash + '</button></div>' : '') +
-          '</div>' +
-        '</div>';
+        return commentItem(c, canDelete ? deleteCommentButton('delete-article-comment', c) : '');
       }).join('') +
       form +
     '</section>';
@@ -979,7 +981,7 @@
     if (!isBlogAuthor()) return viewHeader(TITLES.wsl) + emptyState('Only WSL writers can write articles.');
     const article = route.id ? state.articles[route.id] : null;
     if (route.id) {
-      if (state.missingArticles.has(route.id)) return viewHeader(TITLES.wsl) + emptyState('That article could not be found.');
+      if (state.missing.has('article:' + route.id)) return viewHeader(TITLES.wsl) + emptyState('That article could not be found.');
       if (!article || article.body === null) {
         ensure('article:' + route.id, function () { return loadArticle(route.id); });
         return viewHeader(TITLES.wsl) + emptyState('Loading…');
@@ -1226,8 +1228,22 @@
 
   // ---------- Actions ----------
 
+  // The post/thread/article a clicked element belongs to (nearest data-post etc.)
   function findPost(el) {
     return state.posts[el.closest('[data-post]').dataset.post];
+  }
+
+  function findThread(el) {
+    return state.threads[el.closest('[data-thread]').dataset.thread];
+  }
+
+  function findArticle(el) {
+    return state.articles[el.closest('[data-article]').dataset.article];
+  }
+
+  // Asks before running a delete through run(). Resolves true only if confirmed and successful.
+  async function confirmRun(message, task) {
+    return confirm(message) && run(task);
   }
 
   function lockForm(form) {
@@ -1257,21 +1273,18 @@
       }
     },
     'delete-post': function (el) {
-      if (!confirm('Delete this post?')) return;
       const post = findPost(el);
-      run(function () { return api.deletePost(post); });
+      confirmRun('Delete this post?', function () { return api.deletePost(post); });
     },
     'delete-comment': function (el) {
-      if (!confirm('Delete this comment?')) return;
       const post = findPost(el);
       const comment = findById(post.comments, el.dataset.comment);
-      run(function () { return api.deleteComment(post, comment); });
+      confirmRun('Delete this comment?', function () { return api.deleteComment(post, comment); });
     },
     'delete-reply': function (el) {
-      if (!confirm('Delete this reply?')) return;
-      const thread = state.threads[el.closest('[data-thread]').dataset.thread];
+      const thread = findThread(el);
       const reply = findById(thread.replies, el.dataset.reply);
-      run(function () { return api.deleteReply(thread, reply); });
+      confirmRun('Delete this reply?', function () { return api.deleteReply(thread, reply); });
     },
     'load-more': function (el) {
       const key = el.dataset.list;
@@ -1287,10 +1300,9 @@
       render();
     },
     'delete-article-comment': function (el) {
-      if (!confirm('Delete this comment?')) return;
-      const article = state.articles[el.closest('[data-article]').dataset.article];
+      const article = findArticle(el);
       const comment = findById(article.comments, el.dataset.comment);
-      run(function () { return api.deleteArticleComment(article, comment); });
+      confirmRun('Delete this comment?', function () { return api.deleteArticleComment(article, comment); });
     },
     'cancel-article': function (el) {
       ui.articleEditorFor = null; // drop unsaved changes
@@ -1298,9 +1310,8 @@
       location.hash = el.dataset.href;
     },
     'delete-article': async function () {
-      if (!confirm('Delete this article? This can\'t be undone.')) return;
       const article = state.articles[parseRoute().id];
-      if (await run(function () { return api.deleteArticle(article); })) {
+      if (await confirmRun('Delete this article? This can\'t be undone.', function () { return api.deleteArticle(article); })) {
         ui.articleEditorFor = null;
         location.hash = '#/wsl';
       }
@@ -1320,9 +1331,8 @@
       render();
     },
     'delete-thread': async function (el) {
-      if (!confirm('Delete this thread and all its replies?')) return;
-      const thread = state.threads[el.closest('[data-thread]').dataset.thread];
-      if (await run(function () { return api.deleteThread(thread); })) location.hash = '#/forum';
+      const thread = findThread(el);
+      if (await confirmRun('Delete this thread and all its replies?', function () { return api.deleteThread(thread); })) location.hash = '#/forum';
     },
     'edit-profile': function () {
       ui.editingProfile = true;
