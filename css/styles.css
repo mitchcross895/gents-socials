@@ -600,3 +600,14 @@ a.byline-name:hover { text-decoration: underline; }
   .article { padding: 32px 40px; }
   .article-title { font-size: 2.4rem; }
 }
+
+/* WSL discussion */
+.discussion { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; padding: 20px; }
+.discussion .section-title { margin: 0; }
+.discussion-form { padding: 0; margin: 4px 0 0; gap: 8px; }
+.discussion-form textarea {
+  width: 100%; padding: 10px 12px; resize: vertical;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface);
+}
+.discussion-form textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+@media (min-width: 768px) { .discussion { padding: 24px 40px; } }

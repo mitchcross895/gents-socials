@@ -151,8 +151,11 @@
     });
   }
 
-  // body is null until the article's own page loads it
+  // body and comments are null until the article's own page loads them.
+  // List rows carry a comment count (article_comments(count)); the article page gets the
+  // comments themselves, aliased as "discussion".
   function toArticle(row) {
+    const comments = row.discussion ? row.discussion.map(toEntry) : null;
     return {
       id: row.id,
       authorId: row.author_id,
@@ -162,14 +165,21 @@
       published: row.published,
       createdAt: Date.parse(row.created_at),
       updatedAt: Date.parse(row.updated_at),
-      body: row.body === undefined ? null : row.body
+      body: row.body === undefined ? null : row.body,
+      comments: comments,
+      commentCount: comments ? comments.length : row.article_comments ? row.article_comments[0].count : null
     };
   }
 
+  // Keeps the body and comments already loaded unless the new row shows they've changed
   function storeArticle(row) {
     const article = toArticle(row);
     const old = state.articles[row.id];
-    if (article.body === null && old && old.updatedAt === article.updatedAt) article.body = old.body;
+    if (old) {
+      if (article.body === null && old.updatedAt === article.updatedAt) article.body = old.body;
+      if (article.commentCount === null) article.commentCount = old.commentCount;
+      if (!article.comments && old.comments && old.comments.length === article.commentCount) article.comments = old.comments;
+    }
     return (state.articles[row.id] = article);
   }
 
@@ -192,7 +202,7 @@
   const TABLES = {
     posts: { select: POST_SELECT, store: storePost },
     threads: { select: COLUMNS.thread, store: storeThread },
-    articles: { select: COLUMNS.article, store: storeArticle }
+    articles: { select: COLUMNS.article + ', article_comments(count)', store: storeArticle }
   };
 
   function listSpec(key) {
@@ -249,7 +259,11 @@
   }
 
   async function loadArticle(id) {
-    const row = await query(sb.from('articles').select(COLUMNS.article + ', body').eq('id', id).maybeSingle());
+    const row = await query(sb.from('articles')
+      .select(COLUMNS.article + ', body, discussion:article_comments(' + COLUMNS.comment + ')')
+      .eq('id', id)
+      .order('created_at', { referencedTable: 'discussion', ascending: true })
+      .maybeSingle());
     if (row) storeArticle(row); else state.missingArticles.add(id);
   }
 
@@ -470,6 +484,7 @@
         ? sb.from('articles').update(fields).eq('id', id)
         : sb.from('articles').insert(fields);
       const row = await query(request.select(COLUMNS.article + ', body').single());
+      if (!id) row.discussion = []; // a new article has no comments yet
       storeArticle(row);
       if (!id) prepend('wsl', row.id);
       return row.id;
@@ -479,6 +494,16 @@
       delete state.articles[article.id];
       state.missingArticles.add(article.id); // so the page doesn't try to fetch it again
       removeFiles(BLOG_BUCKET, articleImagePaths(article.body || '').filter(function (p) { return p.indexOf(meId + '/') === 0; }));
+    },
+    addArticleComment: async function (article, text) {
+      const row = await query(sb.from('article_comments').insert({ article_id: article.id, body: text }).select(COLUMNS.comment).single());
+      article.comments.push(toEntry(row));
+      article.commentCount = article.comments.length;
+    },
+    deleteArticleComment: async function (article, comment) {
+      await query(sb.from('article_comments').delete().eq('id', comment.id));
+      article.comments = article.comments.filter(function (c) { return c !== comment; });
+      article.commentCount = article.comments.length;
     },
     uploadBlogImage: async function (file) {
       const path = meId + '/' + Date.now() + '.jpg';
@@ -887,7 +912,8 @@
         (article.published ? '' : '<span class="badge">Draft</span>') +
         '<h2>' + esc(article.title) + '</h2>' +
         (article.summary ? '<p class="muted">' + esc(article.summary) + '</p>' : '') +
-        '<span class="muted small">By ' + esc(author.name) + ' · ' + longDate(article.createdAt) + '</span>' +
+        '<span class="muted small">By ' + esc(author.name) + ' · ' + longDate(article.createdAt) +
+          (article.commentCount ? ' · ' + plural(article.commentCount, 'comment', 'comments') : '') + '</span>' +
       '</div>' +
     '</a>';
   }
@@ -896,7 +922,7 @@
     const back = '<a class="back-link" href="#/wsl">' + ICONS.back + '<span>Back to ' + esc(TITLES.wsl) + '</span></a>';
     const article = state.articles[route.id];
     if (state.missingArticles.has(route.id)) return back + emptyState('That article could not be found.');
-    if (!article || article.body === null) {
+    if (!article || article.body === null || !article.comments) {
       ensure('article:' + route.id, function () { return loadArticle(route.id); });
       return back + emptyState('Loading…');
     }
@@ -914,7 +940,39 @@
           (mine ? '<a class="btn btn-small" href="#/wsl/' + encodeURIComponent(article.id) + '/edit">Edit</a>' : '') +
         '</header>' +
         '<div class="article-body">' + articleBody(article.body) + '</div>' +
-      '</article>';
+      '</article>' +
+      articleDiscussion(article);
+  }
+
+  // Comments under an article. Commenters can delete their own; the writer can delete any.
+  function articleDiscussion(article) {
+    const key = 'article-comment-' + article.id;
+    const canModerate = meId && article.authorId === meId;
+    let form;
+    if (!article.published) form = '<p class="muted small">Comments open once the article is published.</p>';
+    else if (!meId) form = '<p class="muted small"><a href="#/profile">Sign in</a> to join the discussion.</p>';
+    else {
+      form = '<form class="form discussion-form" data-submit="add-article-comment" data-article="' + esc(article.id) + '">' +
+        '<label class="sr-only" for="' + esc(key) + '">Add to the discussion</label>' +
+        '<textarea id="' + esc(key) + '" name="text" rows="3" maxlength="1000" required placeholder="What did you think?" data-draft="' + esc(key) + '">' + draft(key) + '</textarea>' +
+        '<div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Post comment</button></div>' +
+      '</form>';
+    }
+    return '<section class="card discussion" data-article="' + esc(article.id) + '">' +
+      '<h2 class="section-title">Discussion' + (article.comments.length ? ' <span class="muted">(' + article.comments.length + ')</span>' : '') + '</h2>' +
+      (article.comments.length || !article.published ? '' : '<p class="muted small">No comments yet. Start the conversation.</p>') +
+      article.comments.map(function (c) {
+        const u = getUser(c.authorId);
+        const canDelete = meId && (c.authorId === meId || canModerate);
+        return '<div class="comment">' + avatarLink(u, 'sm') +
+          '<div class="comment-main">' +
+            '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
+            (canDelete ? '<div class="comment-actions"><button class="action action-sm action-delete" data-action="delete-article-comment" data-comment="' + esc(c.id) + '" aria-label="Delete comment">' + ICONS.trash + '</button></div>' : '') +
+          '</div>' +
+        '</div>';
+      }).join('') +
+      form +
+    '</section>';
   }
 
   function renderArticleEditor(route) {
@@ -1228,6 +1286,12 @@
       ui.articlePreview = !!el.dataset.preview;
       render();
     },
+    'delete-article-comment': function (el) {
+      if (!confirm('Delete this comment?')) return;
+      const article = state.articles[el.closest('[data-article]').dataset.article];
+      const comment = findById(article.comments, el.dataset.comment);
+      run(function () { return api.deleteArticleComment(article, comment); });
+    },
     'cancel-article': function (el) {
       ui.articleEditorFor = null; // drop unsaved changes
       ui.error = '';
@@ -1363,6 +1427,16 @@
       ui.editingProfile = false;
       if (!(await run(function () { return api.saveProfile(fields, images); }))) {
         ui.editingProfile = true; // keep the form open so the error can be fixed
+        render();
+      }
+    },
+    'add-article-comment': async function (form, data) {
+      const text = data.get('text').trim();
+      const article = state.articles[form.dataset.article];
+      if (!text || !article) return;
+      lockForm(form);
+      if (await run(function () { return api.addArticleComment(article, text); })) {
+        delete ui.drafts['article-comment-' + article.id];
         render();
       }
     },
