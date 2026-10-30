@@ -561,3 +561,8 @@ a.byline-name:hover { text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* Comment actions and paging */
+.comment-actions { display: flex; gap: 2px; }
+.action-delete:hover { color: var(--danger); }
+.load-more { display: flex; justify-content: center; margin-top: 12px; }

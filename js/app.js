@@ -51,13 +51,19 @@
     ? window.supabase.createClient(config.supabaseUrl, config.supabaseKey)
     : null;
 
-  let state = { users: {}, posts: [], threads: [] };
+  const PAGE_SIZE = 15; // posts/threads fetched per "Load more"
+
+  // posts and threads are keyed by id so every list showing an item shares one copy.
+  // lists holds the paged lists that have been loaded (see listSpec).
+  let state = { users: {}, posts: {}, threads: {}, lists: {}, stats: {}, popular: [], missingThreads: new Set() };
   let meId = null; // signed-in user's id; null when signed out
   let loading = !!sb;
   let reloading = null;  // in-flight reload, shared so overlapping calls make one request
   let lastLoadedAt = 0;
   const RELOAD_AFTER_MS = 60 * 1000; // minimum gap between refreshes when returning to the tab
   const pendingLikes = new Set(); // ids of posts/comments with a like request in flight
+  const pendingPages = new Set(); // list keys with a "Load more" in flight
+  let requested = new Set();      // data the views asked for that's been fetched or is on its way
 
   // Transient UI state (not persisted)
   const ui = {
@@ -92,8 +98,10 @@
     profile: 'id, name, handle, bio, color, avatar_path, banner_path',
     post: 'id, author_id, body, image_path, created_at',
     comment: 'id, author_id, body, created_at',
-    thread: 'id, author_id, category, title, body, created_at'
+    thread: 'id, author_id, category, title, body, created_at, reply_count, last_activity_at'
   };
+  const POST_SELECT = COLUMNS.post + ', post_likes(user_id), comments(' + COLUMNS.comment + ', comment_likes(user_id))';
+  const THREAD_PAGE_SELECT = COLUMNS.thread + ', replies(' + COLUMNS.comment + ')';
 
   // ---------- Database rows → app objects ----------
 
@@ -122,30 +130,134 @@
     });
   }
 
+  // replies is null until the thread's own page loads them
   function toThread(row) {
-    return Object.assign(toEntry(row), { category: row.category, title: row.title, replies: (row.replies || []).map(toEntry) });
+    return Object.assign(toEntry(row), {
+      category: row.category,
+      title: row.title,
+      replyCount: row.reply_count,
+      lastActivity: Date.parse(row.last_activity_at),
+      replies: row.replies ? row.replies.map(toEntry) : null
+    });
   }
 
+  function storePost(row) {
+    return (state.posts[row.id] = toPost(row));
+  }
+
+  function storeThread(row) {
+    const thread = toThread(row);
+    const old = state.threads[row.id];
+    // A list row has no replies; keep ones already loaded if nothing has changed
+    if (!thread.replies && old && old.replies && old.replyCount === thread.replyCount) thread.replies = old.replies;
+    return (state.threads[row.id] = thread);
+  }
+
+  // ---------- Paged lists ----------
+  // Keys: 'feed', 'forum/<category>', 'user-posts/<user id>', 'user-threads/<user id>'
+
+  function listSpec(key) {
+    const slash = key.indexOf('/');
+    const kind = slash < 0 ? key : key.slice(0, slash);
+    const arg = slash < 0 ? '' : key.slice(slash + 1);
+    if (kind === 'feed') return { table: 'posts', order: 'created_at' };
+    if (kind === 'forum') return { table: 'threads', order: 'last_activity_at', filter: arg === 'All' ? null : ['category', arg] };
+    if (kind === 'user-posts') return { table: 'posts', order: 'created_at', filter: ['author_id', arg] };
+    return { table: 'threads', order: 'created_at', filter: ['author_id', arg] };
+  }
+
+  // Fetches up to `limit` items older than `cursor` (the sort column's value on the last item so far)
+  async function fetchPage(key, limit, cursor) {
+    const spec = listSpec(key);
+    const posts = spec.table === 'posts';
+    let request = sb.from(spec.table).select(posts ? POST_SELECT : COLUMNS.thread);
+    if (spec.filter) request = request.eq(spec.filter[0], spec.filter[1]);
+    if (cursor) request = request.lt(spec.order, cursor);
+    request = request.order(spec.order, { ascending: false });
+    if (posts) request = request.order('created_at', { referencedTable: 'comments', ascending: true });
+    const rows = await query(request.limit(limit + 1)); // one extra shows whether there are more
+    const page = rows.slice(0, limit);
+    return {
+      ids: page.map(function (row) { return (posts ? storePost(row) : storeThread(row)).id; }),
+      cursor: page.length ? page[page.length - 1][spec.order] : cursor,
+      more: rows.length > limit
+    };
+  }
+
+  async function loadMore(key) {
+    const list = state.lists[key];
+    const page = await fetchPage(key, PAGE_SIZE, list && list.cursor);
+    const ids = list ? list.ids.concat(page.ids.filter(function (id) { return !list.ids.includes(id); })) : page.ids;
+    state.lists[key] = { ids: ids, cursor: page.cursor, more: page.more };
+  }
+
+  // Items in a list that still exist (deleted ones drop out)
+  function listItems(key) {
+    const table = listSpec(key).table === 'posts' ? state.posts : state.threads;
+    return state.lists[key].ids.map(function (id) { return table[id]; }).filter(Boolean);
+  }
+
+  // Adds a new item to the top of a list, if that list has been loaded
+  function prepend(key, id) {
+    if (state.lists[key]) state.lists[key].ids.unshift(id);
+  }
+
+  async function loadThread(id) {
+    const row = await query(sb.from('threads').select(THREAD_PAGE_SELECT).eq('id', id)
+      .order('created_at', { referencedTable: 'replies', ascending: true }).maybeSingle());
+    if (row) storeThread(row); else state.missingThreads.add(id);
+  }
+
+  async function loadStats(id) {
+    const row = await query(sb.rpc('profile_stats', { uid: id }).single());
+    return { posts: row.posts, threads: row.threads, likes: row.likes };
+  }
+
+  function bumpStat(userId, field, delta) {
+    if (state.stats[userId]) state.stats[userId][field] += delta;
+  }
+
+  // Starts loading something a view needs, once. render() runs again when it arrives.
+  function ensure(key, load) {
+    if (requested.has(key)) return;
+    requested.add(key);
+    load().catch(function (err) { ui.error = describeError(err); }).finally(render);
+  }
+
+  // The paged list the current page shows, if any
+  function routeListKey(route) {
+    if (route.name === 'posts') return 'feed';
+    if (route.name === 'forum') return 'forum/' + ui.forumCategory;
+    const userId = route.name === 'profile' ? meId : route.name === 'member' ? route.id : null;
+    return userId ? (ui.profileTab === 'posts' ? 'user-posts/' : 'user-threads/') + userId : null;
+  }
+
+  // Refreshes everything currently on screen in one round of requests. Lists keep as many
+  // items as were already loaded, so "Load more" progress isn't lost.
   async function loadRemoteState() {
+    const route = parseRoute();
+    const keys = Object.keys(state.lists);
+    const current = routeListKey(route);
+    if (current && !keys.includes(current)) keys.push(current);
+    const statIds = Object.keys(state.stats);
+    const profileId = route.name === 'profile' ? meId : route.name === 'member' ? route.id : null;
+    if (profileId && !statIds.includes(profileId)) statIds.push(profileId);
+
     const results = await Promise.all([
       query(sb.from('profiles').select(COLUMNS.profile)),
-      query(sb.from('posts')
-        .select(COLUMNS.post + ', post_likes(user_id), comments(' + COLUMNS.comment + ', comment_likes(user_id))')
-        .order('created_at', { ascending: false })
-        .order('created_at', { referencedTable: 'comments', ascending: true })
-        .limit(200)),
-      query(sb.from('threads')
-        .select(COLUMNS.thread + ', replies(' + COLUMNS.comment + ')')
-        .order('created_at', { ascending: false })
-        .order('created_at', { referencedTable: 'replies', ascending: true })
-        .limit(200))
+      query(sb.from('threads').select(COLUMNS.thread).order('reply_count', { ascending: false }).limit(3)),
+      Promise.all(keys.map(function (key) {
+        return fetchPage(key, Math.max(PAGE_SIZE, state.lists[key] ? state.lists[key].ids.length : 0));
+      })),
+      Promise.all(statIds.map(loadStats)),
+      route.name === 'thread' ? loadThread(route.id) : null
     ]);
 
-    state = {
-      users: Object.fromEntries(results[0].map(function (p) { return [p.id, toUser(p)]; })),
-      posts: results[1].map(toPost), // newest first; kept that way as posts are added
-      threads: results[2].map(toThread)
-    };
+    state.users = Object.fromEntries(results[0].map(function (p) { return [p.id, toUser(p)]; }));
+    state.popular = results[1].map(function (row) { return storeThread(row).id; });
+    state.lists = Object.fromEntries(keys.map(function (key, i) { return [key, results[2][i]]; }));
+    state.stats = Object.fromEntries(statIds.map(function (id, i) { return [id, results[3][i]]; }));
+    requested = new Set();
     lastLoadedAt = Date.now();
   }
 
@@ -236,7 +348,10 @@
       }
       try {
         const row = await query(sb.from('posts').insert({ body: text, image_path: path }).select(COLUMNS.post).single());
-        state.posts.unshift(toPost(row));
+        storePost(row);
+        prepend('feed', row.id);
+        prepend('user-posts/' + meId, row.id);
+        bumpStat(meId, 'posts', 1);
       } catch (err) {
         if (path) removeFiles(POST_BUCKET, [path]); // don't leave an orphaned photo
         throw err;
@@ -252,25 +367,52 @@
     },
     deletePost: async function (post) {
       await query(sb.from('posts').delete().eq('id', post.id));
-      state.posts = state.posts.filter(function (p) { return p !== post; });
+      delete state.posts[post.id];
+      bumpStat(meId, 'posts', -1);
+      bumpStat(meId, 'likes', -post.likes.length);
       if (post.imagePath) removeFiles(POST_BUCKET, [post.imagePath]);
     },
     addComment: async function (post, text) {
       const row = await query(sb.from('comments').insert({ post_id: post.id, body: text }).select(COLUMNS.comment).single());
       post.comments.push(toComment(row));
     },
+    deleteComment: async function (post, comment) {
+      await query(sb.from('comments').delete().eq('id', comment.id));
+      post.comments = post.comments.filter(function (c) { return c !== comment; });
+    },
     createThread: async function (fields) {
       const row = await query(sb.from('threads').insert(fields).select(COLUMNS.thread).single());
-      state.threads.unshift(toThread(row));
+      row.replies = [];
+      storeThread(row);
+      prepend('forum/All', row.id);
+      prepend('forum/' + row.category, row.id);
+      prepend('user-threads/' + meId, row.id);
+      bumpStat(meId, 'threads', 1);
       return row.id;
     },
     addReply: async function (thread, text) {
       const row = await query(sb.from('replies').insert({ thread_id: thread.id, body: text }).select(COLUMNS.comment).single());
-      thread.replies.push(toEntry(row));
+      const reply = toEntry(row);
+      thread.replies.push(reply);
+      thread.replyCount += 1;
+      thread.lastActivity = reply.createdAt;
+    },
+    deleteReply: async function (thread, reply) {
+      await query(sb.from('replies').delete().eq('id', reply.id));
+      thread.replies = thread.replies.filter(function (r) { return r !== reply; });
+      thread.replyCount = Math.max(0, thread.replyCount - 1);
+      const last = thread.replies[thread.replies.length - 1];
+      thread.lastActivity = last ? last.createdAt : thread.createdAt;
     },
     deleteThread: async function (thread) {
       await query(sb.from('threads').delete().eq('id', thread.id));
-      state.threads = state.threads.filter(function (t) { return t !== thread; });
+      delete state.threads[thread.id];
+      bumpStat(meId, 'threads', -1);
+    },
+    // True if a member already uses this handle (checked before sign-up)
+    handleTaken: async function (handle) {
+      const rows = await query(sb.from('profiles').select('id').eq('handle', handle).limit(1));
+      return rows.length > 0;
     },
     // images: { avatar, banner }, each a File to upload, 'remove', or undefined to keep
     saveProfile: async function (fields, images) {
@@ -322,7 +464,9 @@
     if (!requireSignIn() || pendingLikes.has(item.id)) return;
     const before = item.likes;
     const liked = !before.includes(meId);
+    const statChange = table === 'post_likes' ? (liked ? 1 : -1) : 0; // profile totals count post likes only
     item.likes = liked ? before.concat(meId) : before.filter(function (id) { return id !== meId; });
+    bumpStat(item.authorId, 'likes', statChange);
     ui.error = '';
     pendingLikes.add(item.id);
     render();
@@ -330,6 +474,7 @@
       await api.setLiked(table, column, item.id, liked);
     } catch (err) {
       item.likes = before;
+      bumpStat(item.authorId, 'likes', -statChange);
       ui.error = describeError(err);
       render();
     } finally {
@@ -411,11 +556,6 @@
     return n + ' ' + (n === 1 ? one : many);
   }
 
-  function lastActivity(thread) {
-    const last = thread.replies[thread.replies.length - 1];
-    return last ? last.createdAt : thread.createdAt;
-  }
-
   function draft(key) {
     return esc(ui.drafts[key] || '');
   }
@@ -439,8 +579,29 @@
     return '<div class="card signin-prompt"><p>' + esc(message) + '</p><a class="btn btn-primary" href="#/profile">Sign in</a></div>';
   }
 
+  // A paged list with a "Load more" button. Loads the first page if it isn't here yet.
+  // opts: { item(x) → html, wrap(html) → html, empty: html, sort(a, b) optional }
+  function pagedList(key, opts) {
+    const list = state.lists[key];
+    if (!list) {
+      ensure('list:' + key, function () { return loadMore(key); });
+      return emptyState('Loading…');
+    }
+    const items = listItems(key);
+    if (opts.sort) items.sort(opts.sort);
+    if (!items.length && !list.more) return emptyState(opts.empty);
+    const busy = pendingPages.has(key);
+    return opts.wrap(items.map(opts.item).join('')) +
+      (list.more
+        ? '<div class="load-more"><button class="btn" data-action="load-more" data-list="' + esc(key) + '"' + (busy ? ' disabled' : '') + '>' +
+            (busy ? 'Loading…' : 'Load more') + '</button></div>'
+        : '');
+  }
+
+  function postStack(html) { return '<div class="stack">' + html + '</div>'; }
+  function threadList(html) { return '<div class="card thread-list">' + html + '</div>'; }
+
   function renderPosts() {
-    const posts = state.posts; // already newest first
     const composer = meId
       ? '<form class="card composer" data-submit="create-post">' +
           avatar(getUser(meId)) +
@@ -466,7 +627,7 @@
       : signInPrompt('Sign in to share a post with the community.');
 
     return viewHeader('Posts') + composer +
-      '<div class="stack">' + (posts.length ? posts.map(postCard).join('') : emptyState('No posts yet. Be the first to share something.')) + '</div>';
+      pagedList('feed', { item: postCard, wrap: postStack, empty: 'No posts yet. Be the first to share something.' });
   }
 
   function postCard(post) {
@@ -500,7 +661,10 @@
         return '<div class="comment">' + avatarLink(u, 'sm') +
           '<div class="comment-main">' +
             '<div class="comment-bubble">' + byline(u, c.createdAt) + '<p>' + esc(c.text) + '</p></div>' +
-            '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
+            '<div class="comment-actions">' +
+              '<button class="action action-sm' + (liked ? ' liked' : '') + '" data-action="like-comment" data-comment="' + esc(c.id) + '" aria-pressed="' + liked + '" aria-label="Like comment">' + ICONS.heart + '<span>' + c.likes.length + '</span></button>' +
+              (meId && c.authorId === meId ? '<button class="action action-sm action-delete" data-action="delete-comment" data-comment="' + esc(c.id) + '" aria-label="Delete comment">' + ICONS.trash + '</button>' : '') +
+            '</div>' +
           '</div>' +
         '</div>';
       }).join('') +
@@ -516,10 +680,6 @@
   }
 
   function renderForum() {
-    const threads = state.threads
-      .filter(function (t) { return ui.forumCategory === 'All' || t.category === ui.forumCategory; })
-      .sort(function (a, b) { return lastActivity(b) - lastActivity(a); });
-
     const newBtn = '<button class="btn btn-primary" data-action="toggle-new-thread" aria-expanded="' + ui.showNewThread + '">' + ICONS.plus + '<span>New thread</span></button>';
 
     return viewHeader('Forum', newBtn) +
@@ -529,9 +689,13 @@
           return '<button class="chip" data-action="filter-category" data-category="' + esc(c) + '" aria-pressed="' + (ui.forumCategory === c) + '">' + esc(c) + '</button>';
         }).join('') +
       '</div>' +
-      '<div class="card thread-list">' +
-        (threads.length ? threads.map(threadRow).join('') : emptyState('No threads in this category yet.')) +
-      '</div>';
+      pagedList('forum/' + ui.forumCategory, {
+        item: threadRow,
+        wrap: threadList,
+        empty: 'No threads in this category yet.',
+        // replies posted here move a thread up before the next refresh
+        sort: function (a, b) { return b.lastActivity - a.lastActivity; }
+      });
   }
 
   function newThreadForm() {
@@ -554,16 +718,20 @@
       '<div class="thread-row-main">' +
         '<span class="badge">' + esc(thread.category) + '</span>' +
         '<h3><a class="thread-link" href="#/forum/' + encodeURIComponent(thread.id) + '">' + esc(thread.title) + '</a></h3>' +
-        '<span class="muted small"><a class="thread-author" href="' + esc(profileHref(author.id)) + '">' + esc(author.name) + '</a> · active ' + timeAgo(lastActivity(thread)) + '</span>' +
+        '<span class="muted small"><a class="thread-author" href="' + esc(profileHref(author.id)) + '">' + esc(author.name) + '</a> · active ' + timeAgo(thread.lastActivity) + '</span>' +
       '</div>' +
-      '<div class="thread-row-count"><strong>' + thread.replies.length + '</strong><span class="muted small">' + (thread.replies.length === 1 ? 'reply' : 'replies') + '</span></div>' +
+      '<div class="thread-row-count"><strong>' + thread.replyCount + '</strong><span class="muted small">' + (thread.replyCount === 1 ? 'reply' : 'replies') + '</span></div>' +
     '</div>';
   }
 
   function renderThread(route) {
-    const thread = findById(state.threads, route.id);
+    const thread = state.threads[route.id];
     const back = '<a class="back-link" href="#/forum">' + ICONS.back + '<span>Back to forum</span></a>';
-    if (!thread) return back + emptyState('That thread could not be found. It may have been deleted.');
+    if (state.missingThreads.has(route.id)) return back + emptyState('That thread could not be found. It may have been deleted.');
+    if (!thread || !thread.replies) {
+      ensure('thread:' + route.id, function () { return loadThread(route.id); });
+      return back + emptyState('Loading…');
+    }
 
     const author = getUser(thread.authorId);
     const key = 'reply-' + thread.id;
@@ -581,7 +749,9 @@
       '<div class="stack">' +
         thread.replies.map(function (r) {
           const u = getUser(r.authorId);
-          return '<div class="card reply"><header class="post-head">' + avatarLink(u, 'sm') + byline(u, r.createdAt) + '</header><p class="post-body">' + esc(r.text) + '</p></div>';
+          return '<div class="card reply"><header class="post-head">' + avatarLink(u, 'sm') + byline(u, r.createdAt) +
+              (meId && r.authorId === meId ? '<button class="icon-btn" data-action="delete-reply" data-thread="' + esc(thread.id) + '" data-reply="' + esc(r.id) + '" aria-label="Delete reply">' + ICONS.trash + '</button>' : '') +
+            '</header><p class="post-body">' + esc(r.text) + '</p></div>';
         }).join('') +
       '</div>' +
       (meId
@@ -606,23 +776,25 @@
 
   // Profile header, stats and the member's posts/threads. isMe adds editing and sign-out.
   function profilePage(user, isMe) {
-    function byUser(item) { return item.authorId === user.id; }
-    const posts = state.posts.filter(byUser); // both lists are already newest first
-    const threads = state.threads.filter(byUser);
-    const likes = posts.reduce(function (sum, p) { return sum + p.likes.length; }, 0);
     const color = safeColor(user.color, AVATAR_COLORS[0]);
     const editing = isMe && ui.editingProfile;
 
-    let list;
-    if (ui.profileTab === 'posts') {
-      list = posts.length
-        ? '<div class="stack">' + posts.map(postCard).join('') + '</div>'
-        : emptyState(isMe ? 'You haven\'t posted yet. Head to <a href="#/posts">Posts</a> to share something.' : esc(user.name) + ' hasn\'t posted yet.');
-    } else {
-      list = threads.length
-        ? '<div class="card thread-list">' + threads.map(threadRow).join('') + '</div>'
-        : emptyState(isMe ? 'You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.' : esc(user.name) + ' hasn\'t started any threads yet.');
-    }
+    // Totals come from the database; shown as "–" until they arrive
+    const stats = state.stats[user.id];
+    if (!stats) ensure('stats:' + user.id, async function () { state.stats[user.id] = await loadStats(user.id); });
+    function stat(field) { return stats ? stats[field] : '–'; }
+
+    const list = ui.profileTab === 'posts'
+      ? pagedList('user-posts/' + user.id, {
+          item: postCard,
+          wrap: postStack,
+          empty: isMe ? 'You haven\'t posted yet. Head to <a href="#/posts">Posts</a> to share something.' : esc(user.name) + ' hasn\'t posted yet.'
+        })
+      : pagedList('user-threads/' + user.id, {
+          item: threadRow,
+          wrap: threadList,
+          empty: isMe ? 'You haven\'t started any threads. Visit the <a href="#/forum">Forum</a> to begin one.' : esc(user.name) + ' hasn\'t started any threads yet.'
+        });
 
     const footer = isMe ? '<p class="reset-note"><button class="btn" data-action="sign-out">Sign out</button></p>' : '';
 
@@ -640,9 +812,9 @@
             '<p class="muted">@' + esc(user.handle) + '</p>' +
             (user.bio ? '<p class="profile-bio">' + esc(user.bio) + '</p>' : '')) +
           '<dl class="stats">' +
-            '<div><dt>Posts</dt><dd>' + posts.length + '</dd></div>' +
-            '<div><dt>Threads</dt><dd>' + threads.length + '</dd></div>' +
-            '<div><dt>Likes</dt><dd>' + likes + '</dd></div>' +
+            '<div><dt>Posts</dt><dd>' + stat('posts') + '</dd></div>' +
+            '<div><dt>Threads</dt><dd>' + stat('threads') + '</dd></div>' +
+            '<div><dt>Likes</dt><dd>' + stat('likes') + '</dd></div>' +
           '</dl>' +
         '</div>' +
       '</section>' +
@@ -686,10 +858,11 @@
         '<p class="muted">' + (signup ? 'Join to post, comment and start forum threads.' : 'Welcome back. Sign in to post and reply.') + '</p>' +
         (ui.authNotice ? '<p class="notice">' + esc(ui.authNotice) + '</p>' : '') +
         (signup
-          ? '<label class="field"><span>Name</span><input name="name" maxlength="40" autocomplete="name" required></label>' +
-            '<label class="field"><span>Handle</span><input name="handle" maxlength="15" pattern="[A-Za-z0-9_]+" title="Letters, numbers and underscores only" autocomplete="username" required></label>'
+          ? '<label class="field"><span>Name</span><input name="name" maxlength="40" autocomplete="name" required data-draft="auth-name" value="' + draft('auth-name') + '"></label>' +
+            '<label class="field"><span>Handle</span><input name="handle" maxlength="15" pattern="[A-Za-z0-9_]+" title="Letters, numbers and underscores only" autocomplete="username" required data-draft="auth-handle" value="' + draft('auth-handle') + '"></label>'
           : '') +
-        '<label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" required></label>' +
+        // Kept in drafts so an error doesn't clear what was typed (the password isn't kept)
+        '<label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" required data-draft="auth-email" value="' + draft('auth-email') + '"></label>' +
         '<label class="field"><span>Password</span><input name="password" type="password" minlength="6" autocomplete="' + (signup ? 'new-password' : 'current-password') + '" required></label>' +
         '<div class="form-actions"><button class="btn btn-primary" type="submit">' + (signup ? 'Create account' : 'Sign in') + '</button></div>' +
         '<p class="small muted auth-switch">' + (signup ? 'Already have an account? ' : 'New here? ') +
@@ -698,13 +871,13 @@
   }
 
   function renderAside() {
-    const popular = state.threads.slice().sort(function (a, b) { return b.replies.length - a.replies.length; }).slice(0, 3);
+    const popular = state.popular.map(function (id) { return state.threads[id]; }).filter(Boolean);
     const members = Object.values(state.users).filter(function (u) { return u.id !== meId; });
 
     return '<section class="card aside-card"><h2>Popular threads</h2>' +
         (popular.length
           ? '<ol class="aside-list">' + popular.map(function (t) {
-              return '<li><a href="#/forum/' + encodeURIComponent(t.id) + '">' + esc(t.title) + '</a><span class="muted small">' + esc(t.category) + ' · ' + plural(t.replies.length, 'reply', 'replies') + '</span></li>';
+              return '<li><a href="#/forum/' + encodeURIComponent(t.id) + '">' + esc(t.title) + '</a><span class="muted small">' + esc(t.category) + ' · ' + plural(t.replyCount, 'reply', 'replies') + '</span></li>';
             }).join('') + '</ol>'
           : '<p class="muted small">No threads yet.</p>') +
       '</section>' +
@@ -776,7 +949,7 @@
   // ---------- Actions ----------
 
   function findPost(el) {
-    return findById(state.posts, el.closest('[data-post]').dataset.post);
+    return state.posts[el.closest('[data-post]').dataset.post];
   }
 
   function lockForm(form) {
@@ -810,6 +983,27 @@
       const post = findPost(el);
       run(function () { return api.deletePost(post); });
     },
+    'delete-comment': function (el) {
+      if (!confirm('Delete this comment?')) return;
+      const post = findPost(el);
+      const comment = findById(post.comments, el.dataset.comment);
+      run(function () { return api.deleteComment(post, comment); });
+    },
+    'delete-reply': function (el) {
+      if (!confirm('Delete this reply?')) return;
+      const thread = state.threads[el.closest('[data-thread]').dataset.thread];
+      const reply = findById(thread.replies, el.dataset.reply);
+      run(function () { return api.deleteReply(thread, reply); });
+    },
+    'load-more': function (el) {
+      const key = el.dataset.list;
+      if (pendingPages.has(key)) return;
+      pendingPages.add(key);
+      render();
+      loadMore(key)
+        .catch(function (err) { ui.error = describeError(err); })
+        .finally(function () { pendingPages.delete(key); render(); });
+    },
     'remove-post-image': function () {
       setPostImage(null);
       render();
@@ -826,7 +1020,7 @@
     },
     'delete-thread': async function (el) {
       if (!confirm('Delete this thread and all its replies?')) return;
-      const thread = findById(state.threads, el.closest('[data-thread]').dataset.thread);
+      const thread = state.threads[el.closest('[data-thread]').dataset.thread];
       if (await run(function () { return api.deleteThread(thread); })) location.hash = '#/forum';
     },
     'edit-profile': function () {
@@ -873,7 +1067,7 @@
     },
     'add-comment': async function (form, data) {
       const text = data.get('text').trim();
-      const post = findById(state.posts, form.dataset.post);
+      const post = state.posts[form.dataset.post];
       if (!text || !post) return;
       lockForm(form);
       if (await run(function () { return api.addComment(post, text); })) {
@@ -895,7 +1089,7 @@
     },
     'add-reply': async function (form, data) {
       const text = data.get('text').trim();
-      const thread = findById(state.threads, form.dataset.thread);
+      const thread = state.threads[form.dataset.thread];
       if (!text || !thread) return;
       lockForm(form);
       if (await run(function () { return api.addReply(thread, text); })) {
@@ -945,12 +1139,27 @@
       // On success, onAuthStateChange loads the signed-in view
     },
     'sign-up': async function (form, data) {
+      const handle = data.get('handle').trim().toLowerCase();
       lockForm(form);
+      // Without this check the database would quietly add numbers to a taken handle
+      let taken;
+      try {
+        taken = await api.handleTaken(handle);
+      } catch (err) {
+        ui.error = describeError(err);
+        render();
+        return;
+      }
+      if (taken) {
+        ui.error = '@' + handle + ' is already taken. Please choose another handle.';
+        render();
+        return;
+      }
       const result = await sb.auth.signUp({
         email: data.get('email'),
         password: data.get('password'),
         options: {
-          data: { name: data.get('name').trim(), handle: data.get('handle').trim().toLowerCase() },
+          data: { name: data.get('name').trim(), handle: handle },
           emailRedirectTo: location.origin + location.pathname
         }
       });
@@ -1013,7 +1222,10 @@
       meId = id;
       ui.editingProfile = false;
       ui.error = '';
-      if (id) ui.authNotice = '';
+      if (id) {
+        ui.authNotice = '';
+        ['auth-name', 'auth-handle', 'auth-email'].forEach(function (key) { delete ui.drafts[key]; });
+      }
       // Defer: calling Supabase from inside this callback can deadlock
       setTimeout(reload, 0);
     });
